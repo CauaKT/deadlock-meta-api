@@ -1,0 +1,59 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+model User {
+  id            String     @id @default(uuid())
+  email         String     @unique
+  passwordHash  String     @map("password_hash")
+  role          Role       @default(USER)
+  emailVerified Boolean    @default(false) @map("email_verified")
+  profile       Profile?
+  tierLists     TierList[]
+  createdAt     DateTime   @default(now()) @map("created_at")
+  updatedAt     DateTime   @updatedAt @map("updated_at")
+
+  @@map("users")
+}
+
+model Profile {
+  id             String   @id @default(uuid())
+  userId         String   @unique @map("user_id")
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  username       String
+  handle         String?  @unique
+  bio            String?
+  avatarUrl      String?  @map("avatar_url")
+  steamId        String?  @map("steam_id")
+  favoriteHeroId Int?     @map("favorite_hero_id")
+  bannerHeroId   Int?     @map("banner_hero_id")
+  bannerImage    String?  @map("banner_image")
+  profileColor   String?  @map("profile_color")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  @@map("profiles")
+}
+
+model TierList {
+  id         String   @id @default(uuid())
+  userId     String?  @map("user_id")
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  title      String
+  authorName String?  @map("author_name")
+  tiers      Json
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@map("tier_lists")
+}
