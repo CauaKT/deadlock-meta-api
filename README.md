@@ -1,132 +1,163 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# LockPro API (`deadlock-meta-api`)
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+API REST do projeto **LockPro**, responsável por autenticação, gerenciamento de sessões, perfis de usuários, envio de e-mails transacionais e administração.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+- Repositório do front-end: `github.com/CauaKT/deadlock-meta`
+- Produção: Front-end na Vercel (`https://lockpro.vercel.app`) com proxy `/api/backend/*` → API em Docker no Render (`https://deadlock-meta-api.onrender.com`) → PostgreSQL no Neon (`sa-east-1`).
 
-## Description
+---
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+## Stack
 
-## Project setup
+- **Runtime / Framework:** Node.js 22 (Docker) + NestJS 12 + Express 5 + TypeScript 6
+- **Banco de Dados & ORM:** PostgreSQL 16 + Prisma 6 (`url` pooled + `directUrl` para migrations)
+- **Autenticação:** JWT em cookie `httpOnly` (`lockpro_session`) + bcryptjs (hash de senha) + Google OAuth 2.0
+- **E-mail:** Brevo HTTP API (`BREVO_API_KEY`, porta 443) com fallback para SMTP via Nodemailer e simulação `[DEV MAIL]` em desenvolvimento
+- **Segurança & Qualidade:** `@nestjs/throttler` (rate limit), `class-validator` / `class-transformer`, `oxlint`
 
-```bash
-$ npm install
-```
+---
 
-## Compile and run the project
+## Arquitetura de Produção (Proxy First-Party)
 
-```bash
-# development
-$ npm run start
+Em produção, o front-end Next.js (`next.config.ts`) expõe o rewrite `/api/backend/:path*` apontando para `API_URL`.
+- Todas as chamadas do navegador (login, cadastro, logout, onboarding, perfis e callback do Google OAuth) trafegam pela mesma origem do front-end (`https://lockpro.vercel.app/api/backend/...`).
+- Isso garante que o cookie `lockpro_session` (`httpOnly`, `sameSite: "lax"`, `secure: true` em produção/HTTPS) seja tratado como **first-party** pelos navegadores, evitando bloqueios cross-site entre `*.vercel.app` e `*.onrender.com`.
+- No SSR do Next.js (`lib/backend/server.ts`), o servidor do front-end repassa o cookie `lockpro_session` manualmente no header `Cookie` para `API_URL`.
 
-# watch mode
-$ npm run start:dev
+---
 
-# production mode
-$ npm run start:prod
-```
+## Como Rodar Localmente com Docker
 
-## Run tests
+### 1. Pré-requisitos
+- Node.js 22+
+- Docker e Docker Compose
+
+### 2. Subir o PostgreSQL com Docker
+Na raiz do repositório `deadlock-meta-api`:
 
 ```bash
-# unit tests
-$ npm run test
-
-# e2e tests
-$ npm run test:e2e
-
-# test coverage
-$ npm run test:cov
+cp .env.example .env
+docker compose up -d
 ```
 
-## Deployment
+O `docker-compose.yml` sobe o container `deadlock-meta-postgres` (`postgres:16-alpine`) na porta `5432` com banco `deadlock_meta`, usuário `postgres` e senha `postgres`.
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
-
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+### 3. Instalar dependências, aplicar migrations e iniciar a API
 
 ```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
+npm install
+npx prisma generate
+npx prisma migrate deploy
+npm run start:dev
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+A API sobe em `http://localhost:3001` (verifique `http://localhost:3001/health`).
 
-## Observability
-
-In production applications, observability is essential for understanding how your system behaves, detecting issues early, and maintaining reliable performance.
-
-[NestJS Observe](https://observe.nestjs.com) automatically instruments your NestJS application, giving you deep visibility into your system with minimal setup:
-
-- **Distributed tracing:** Follow requests across services and understand how they flow through your system.
-- **Waterfall analysis:** Visualize request execution and identify slow operations, bottlenecks, and unexpected delays.
-- **Performance analysis:** Analyze application performance in real time and quickly pinpoint areas that need optimization.
-- **Metrics:** Track key application and infrastructure metrics to understand system health and performance trends.
-- **Logging:** Centralize and correlate logs with traces and other telemetry to make debugging easier.
-- **Error tracking:** Detect errors quickly and investigate their root causes with the surrounding context.
-- **SLA monitoring:** Track service-level objectives and identify when your application is approaching or exceeding defined thresholds.
-- **Alarms and alerts:** Set up alerts for critical errors, performance degradation, SLA violations, and other anomalies so your team can react quickly.
-
-To add it to this project, run this and approve the code it prints at [observe.nestjs.com/link](https://observe.nestjs.com/link) - signing up for free if you have no account:
+### 4. Build e execução em container Docker (produção)
 
 ```bash
-$ npx @nestjs/observe link
+docker build -t deadlock-meta-api .
+docker run --rm -p 3001:3001 --env-file .env deadlock-meta-api
 ```
 
-It installs `@nestjs/observe`, wires it into `AppModule` and `main.ts`, and writes the app key and secret into `.env`, which every `nest start` script (`start`, `start:dev`, `start:debug`) then loads. In production, set `OBSERVE_APP_KEY` and `OBSERVE_APP_SECRET` in the environment instead.
+### Scripts úteis
 
-Or do it by hand:
+| Script | Descrição |
+| --- | --- |
+| `npm run start:dev` | Inicia a API em modo watch |
+| `npm run build` | Compila para `dist/` (`nest build`) |
+| `npm run start:prod` | Executa `node dist/main` |
+| `npm run lint` | Executa `oxlint --type-aware` em `src/` e `test/` |
+| `npm run admin:promote` | Executa `scripts/promote-admin.mjs` carregando `.env` para promover um usuário a `ADMIN` |
 
-```bash
-$ npm install @nestjs/observe
-```
+---
 
-Then follow the [setup guide](https://docs.nestjs.com/observability/sdk) - it takes a single import and an app key.
+## Variáveis de Ambiente
 
-The free plan needs no payment details and covers 300,000 events a month. You can also browse the [live demo](https://www.observe-demo.nestjs.com/dashboard) first - the whole dashboard over a busy service's data, with nothing to install.
+| Variável | Obrigatória | Descrição |
+| --- | --- | --- |
+| `DATABASE_URL` | Sim | Connection string do PostgreSQL (em produção no Neon, usar a URL **pooled**) |
+| `DIRECT_URL` | Sim | Connection string direta (sem pooler) usada pelo Prisma em migrations |
+| `PORT` | Não | Porta HTTP da API (padrão `3001`; no Render é injetada automaticamente) |
+| `APP_URL` | Não | URL pública da própria API (padrão `http://localhost:3001`) |
+| `FRONTEND_URL` | Sim | Origem(ns) do front-end separadas por vírgula para CORS e redirects (ex.: `https://lockpro.vercel.app`) |
+| `PUBLIC_API_URL` | Não | Sobrescreve a base pública usada em links de verificação (padrão `${FRONTEND_URL}/api/backend`) |
+| `GOOGLE_CALLBACK_URL` | Não | Sobrescreve a `redirect_uri` do Google OAuth (padrão `${PUBLIC_API_URL}/auth/google/callback`) |
+| `JWT_SECRET` | Sim | Segredo usado para assinar e verificar os tokens JWT de sessão |
+| `JWT_EXPIRES_IN` | Não | Expiração do JWT (padrão `7d`) |
+| `REQUIRE_EMAIL_VERIFICATION` | Não | `"true"` exige confirmação de e-mail antes do login por senha |
+| `GOOGLE_CLIENT_ID` | Não | Client ID do Google OAuth 2.0 |
+| `GOOGLE_CLIENT_SECRET` | Não | Client Secret do Google OAuth 2.0 |
+| `BREVO_API_KEY` | Não | Chave da API HTTP da Brevo (porta 443 — recomendada em hosts que bloqueiam porta 587) |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS` | Não | Fallback SMTP tradicional caso `BREVO_API_KEY` não esteja definida |
+| `SMTP_FROM` | Não | Remetente dos e-mails (padrão `LockPro <cauakt@gmail.com>`) |
 
-## Resources
+---
 
-Check out a few resources that may come in handy when working with NestJS:
+## Modelo de Dados (`prisma/schema.prisma`)
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Auto-instrument your application with [NestJS Observe](https://observe.nestjs.com). Distributed tracing, metrics, and logging made easy. Error tracking and performance monitoring for your NestJS applications.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+### Enums
+- `Role`: `USER` | `ADMIN`
+- `TokenType`: `EMAIL_VERIFY` | `PASSWORD_RESET`
 
-## Support
+### Tabelas
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+| Tabela (`@@map`) | Model | Campos principais & relações |
+| --- | --- | --- |
+| `users` | `User` | `id` (UUID PK), `email` (unique), `password_hash` (nullable), `google_id` (unique, nullable), `role` (`Role`, default `USER`), `email_verified` (default `false`), `created_at`, `updated_at`. Relações `1:1` com `Profile`, `1:N` com `AuthToken` e `TierList`. |
+| `auth_tokens` | `AuthToken` | `id` (UUID PK), `user_id` (FK → `users.id`, `ON DELETE CASCADE`), `type` (`TokenType`), `token_hash` (unique, SHA-256), `expires_at`, `created_at`. Índice em `[user_id, type]`. |
+| `profiles` | `Profile` | `id` (UUID PK), `user_id` (unique FK → `users.id`, `ON DELETE CASCADE`), `username` (unique, nullable), `handle` (unique, nullable), `bio`, `avatar_url`, `steam_id`, `favorite_hero_id`, `banner_hero_id`, `banner_image`, `profile_color`, `created_at`, `updated_at`. |
+| `tier_lists` | `TierList` | `id` (UUID PK), `user_id` (nullable FK → `users.id`, `ON DELETE SET NULL`), `title`, `author_name`, `tiers` (`Json`), `created_at`, `updated_at`. *(Estrutura preparada para o módulo P3 de TierMaker.)* |
 
-## Stay in touch
+---
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+## Endpoints
 
-## License
+### Saúde
+| Método | Rota | Acesso | Descrição |
+| --- | --- | --- | --- |
+| `GET` | `/` | Público | Mensagem básica de status da API |
+| `GET` | `/health` | Público | Verifica conectividade com o PostgreSQL (`{"status":"ok","db":"up"}`) |
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+### Autenticação (`/auth`)
+| Método | Rota | Acesso | Rate limit | Descrição |
+| --- | --- | --- | --- | --- |
+| `POST` | `/auth/register` | Público | 5 / 60s | Cria usuário + perfil, verifica unicidade de e-mail/nick e envia link de confirmação (ou abre sessão direta se `REQUIRE_EMAIL_VERIFICATION !== "true"`) |
+| `POST` | `/auth/login` | Público | 10 / 60s | Valida credenciais e grava cookie `lockpro_session` |
+| `POST` | `/auth/logout` | Público | Global | Limpa o cookie `lockpro_session` |
+| `GET` | `/auth/me` | `JwtAuthGuard` | Global | Retorna dados de sessão e resumo do perfil do usuário autenticado |
+| `POST` | `/auth/verify-email` | Público | 10 / 60s | Valida token de confirmação de e-mail via corpo JSON |
+| `GET` | `/auth/verify-email` | Público | 10 / 60s | Valida `?token=` do link de e-mail e redireciona para `${FRONTEND_URL}/login?verified=1` (ou erro) |
+| `POST` | `/auth/resend-verification` | Público | 3 / 60s | Reenvia e-mail de confirmação com resposta genérica anti-enumeração |
+| `POST` | `/auth/forgot-password` | Público | 3 / 60s | Gera token `PASSWORD_RESET` (1h) e envia link para `${FRONTEND_URL}/reset-password` |
+| `POST` | `/auth/reset-password` | Público | 5 / 60s | Atualiza senha via token e invalida tokens de reset do usuário |
+| `GET` | `/auth/google` | Público | 15 / 60s | Grava cookie `lockpro_oauth_state` e redireciona para o consentimento do Google |
+| `GET` | `/auth/google/callback` | Público | 15 / 60s | Valida `state`, vincula/cria conta Google, grava `lockpro_session` e redireciona para `/welcome` ou `next` |
+
+### Perfis (`/profiles`)
+| Método | Rota | Acesso | Descrição |
+| --- | --- | --- | --- |
+| `GET` | `/profiles/me` | `JwtAuthGuard` | Retorna o perfil completo do usuário autenticado |
+| `PUT` | `/profiles/onboarding` | `JwtAuthGuard` | Define `username`, `@handle` e `avatarUrl` no primeiro acesso |
+| `PATCH` | `/profiles/me/look` | `JwtAuthGuard` | Atualiza aparência pública do perfil (`username`, `bio`, `handle`, `avatarUrl`, `bannerHeroId`, `bannerImage`) |
+| `PATCH` | `/profiles/me/settings` | `JwtAuthGuard` | Atualiza configurações do perfil (`username`, `steamId`, `profileColor`, `favoriteHeroId`, `bannerHeroId`, `bannerImage`) |
+| `GET` | `/profiles/community` | `OptionalJwtAuthGuard` | Lista sugestões públicas da comunidade (exclui o próprio usuário quando autenticado) |
+| `GET` | `/profiles/by-handle/:handle` | `OptionalJwtAuthGuard` | Retorna visualização pública de um perfil pelo `@handle` (sem expor e-mail ou `steamId`) |
+
+### Administração (`/admin`)
+| Método | Rota | Acesso | Descrição |
+| --- | --- | --- | --- |
+| `GET` | `/admin/overview` | `JwtAuthGuard` + `RolesGuard` (`ADMIN`) | Visão geral de contagens do sistema |
+| `GET` | `/admin/users` | `JwtAuthGuard` + `RolesGuard` (`ADMIN`) | Lista paginada de usuários com filtro opcional `?search=` |
+| `PATCH` | `/admin/users/:id/role` | `JwtAuthGuard` + `RolesGuard` (`ADMIN`) | Altera a role (`USER` / `ADMIN`) de um usuário específico |
+
+---
+
+## Regras de Acesso e Segurança
+
+- **Autenticação (`JwtAuthGuard`):** lê o JWT do cookie `lockpro_session` (ou `Authorization: Bearer`), valida assinatura com `JWT_SECRET` e confirma o usuário no PostgreSQL, anexando `{ userId, email, role }` em `req.user`.
+- **Autorização por Role (`RolesGuard` + `@Roles`):** rotas administrativas exigem `role === "ADMIN"`, retornando `403 Forbidden` para usuários comuns.
+- **Escopo de Dono do Recurso:** rotas de leitura privada e edição de perfil (`GET /profiles/me`, `PUT /profiles/onboarding`, `PATCH /profiles/me/*`) usam exclusivamente `user.userId` extraído do JWT — nunca aceitam `userId` do corpo ou da URL.
+- **Proteção de Dados Públicos:** `GET /profiles/community` e `GET /profiles/by-handle/:handle` expõem apenas campos públicos do perfil (sem `email`, `passwordHash`, `googleId` ou `steamId`).
+- **Rate Limiting (`ThrottlerModule`):** limite global de `60` requisições por `60s` por IP (`app.set('trust proxy', 1)` ativo para leitura correta de IP atrás de proxy reverso), com limites mais restritos nas rotas de `/auth/*`.
+- **Validação & Payloads:** `ValidationPipe` global configurado com `whitelist: true`, `forbidNonWhitelisted: true` e `transform: true`; limite de body JSON/urlencoded em `2mb`.
