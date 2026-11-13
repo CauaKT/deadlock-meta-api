@@ -71,6 +71,22 @@ export class AuthService {
       .replace(/\/+$/, '');
   }
 
+  private getPublicApiUrl(): string {
+    const explicit = this.config.get<string>('PUBLIC_API_URL')?.trim();
+    if (explicit) {
+      return explicit.replace(/\/+$/, '');
+    }
+    return `${this.getFrontendUrl()}/api/backend`;
+  }
+
+  private getGoogleRedirectUri(): string {
+    const explicit = this.config.get<string>('GOOGLE_CALLBACK_URL')?.trim();
+    if (explicit) {
+      return explicit.replace(/\/+$/, '');
+    }
+    return `${this.getPublicApiUrl()}/auth/google/callback`;
+  }
+
   private hashToken(rawToken: string): string {
     return crypto.createHash('sha256').update(rawToken).digest('hex');
   }
@@ -156,7 +172,7 @@ export class AuthService {
 
     if (requireVerify) {
       const rawToken = await this.issueToken(createdUser.id, TokenType.EMAIL_VERIFY, 24);
-      const verifyUrl = `${this.getApiUrl()}/auth/verify-email?token=${encodeURIComponent(rawToken)}`;
+      const verifyUrl = `${this.getPublicApiUrl()}/auth/verify-email?token=${encodeURIComponent(rawToken)}`;
       await this.mail.sendVerificationEmail(createdUser.email, verifyUrl);
       return {
         requiresEmailVerification: true,
@@ -278,7 +294,7 @@ export class AuthService {
     }
 
     const rawToken = await this.issueToken(user.id, TokenType.EMAIL_VERIFY, 24);
-    const verifyUrl = `${this.getApiUrl()}/auth/verify-email?token=${encodeURIComponent(rawToken)}`;
+    const verifyUrl = `${this.getPublicApiUrl()}/auth/verify-email?token=${encodeURIComponent(rawToken)}`;
     await this.mail.sendVerificationEmail(user.email, verifyUrl);
 
     return generic;
@@ -341,7 +357,7 @@ export class AuthService {
       return null;
     }
 
-    const redirectUri = `${this.getApiUrl()}/auth/google/callback`;
+    const redirectUri = this.getGoogleRedirectUri();
     const params = new URLSearchParams({
       client_id: clientId,
       redirect_uri: redirectUri,
@@ -360,7 +376,7 @@ export class AuthService {
   }> {
     const clientId = this.config.getOrThrow<string>('GOOGLE_CLIENT_ID').trim();
     const clientSecret = this.config.getOrThrow<string>('GOOGLE_CLIENT_SECRET').trim();
-    const redirectUri = `${this.getApiUrl()}/auth/google/callback`;
+    const redirectUri = this.getGoogleRedirectUri();
 
     const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
       method: 'POST',

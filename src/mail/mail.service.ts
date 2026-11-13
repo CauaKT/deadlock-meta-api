@@ -7,6 +7,7 @@ import type { Transporter } from 'nodemailer';
 export class MailService {
   private readonly logger = new Logger(MailService.name);
   private readonly transporter: Transporter | null;
+  private readonly brevoApiKey: string | null;
   private readonly from: string;
 
   constructor(private readonly config: ConfigService) {
@@ -14,7 +15,10 @@ export class MailService {
     const port = Number(this.config.get<string>('SMTP_PORT') ?? 587);
     const user = this.config.get<string>('SMTP_USER')?.trim();
     const pass = this.config.get<string>('SMTP_PASS')?.trim();
+    const apiKey = this.config.get<string>('BREVO_API_KEY')?.trim();
+
     this.from = this.config.get<string>('SMTP_FROM') ?? 'LockPro <cauakt@gmail.com>';
+    this.brevoApiKey = apiKey || null;
 
     if (user && pass) {
       this.transporter = nodemailer.createTransport({
@@ -25,8 +29,22 @@ export class MailService {
       });
     } else {
       this.transporter = null;
-      this.logger.warn('SMTP_USER/SMTP_PASS vazios: e-mails serão apenas simulados em log local.');
+      if (!this.brevoApiKey) {
+        this.logger.warn(
+          'BREVO_API_KEY e SMTP_USER/SMTP_PASS vazios: e-mails serão apenas simulados em log local.',
+        );
+      }
     }
+  }
+
+  private parseSender(): { name?: string; email: string } {
+    const match = /^(.*?)<([^>]+)>$/.exec(this.from.trim());
+    if (match) {
+      const name = match[1].trim().replace(/^"|"$/g, '');
+      const email = match[2].trim();
+      return name ? { name, email } : { email };
+    }
+    return { email: this.from.trim() };
   }
 
   async sendVerificationEmail(to: string, verifyUrl: string): Promise<void> {
@@ -59,6 +77,33 @@ export class MailService {
     await this.send(to, subject, text, html, resetUrl);
   }
 
+  private async sendViaBrevoHttp(
+    to: string,
+    subject: string,
+    text: string,
+    html: string,
+  ): Promise<void> {
+    const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'api-key': this.brevoApiKey!,
+      },
+      body: JSON.stringify({
+        sender: this.parseSender(),
+        to: [{ email: to }],
+        subject,
+        textContent: text,
+        htmlContent: html,
+      }),
+    });
+
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '');
+      throw new Error(`Brevo HTTP ${res.status}: ${detail}`);
+    }
+  }
+
   private async send(
     to: string,
     subject: string,
@@ -66,19 +111,24 @@ export class MailService {
     html: string,
     devUrl: string,
   ): Promise<void> {
-    if (!this.transporter) {
-      if (this.config.get<string>('NODE_ENV') !== 'production') {
-        this.logger.log(`[DEV MAIL] para=${to} | assunto="${subject}" | url=${devUrl}`);
-      }
+    if (this.brevoApiKey) {
+      await this.sendViaBrevoHttp(to, subject, text, html);
       return;
     }
 
-    await this.transporter.sendMail({
-      from: this.from,
-      to,
-      subject,
-      text,
-      html,
-    });
+    if (this.transporter) {
+      await this.transporter.sendMail({
+        from: this.from,
+        to,
+        subject,
+        text,
+        html,
+      });
+      return;
+    }
+
+    if (this.config.get<string>('NODE_ENV') !== 'production') {
+      this.logger.log(`[DEV MAIL] para=${to} | assunto="${subject}" | url=${devUrl}`);
+    }
   }
 }

@@ -41,7 +41,8 @@ export class AuthController {
   private sessionCookieOptions(): CookieOptions {
     const isHttps =
       this.config.get<string>('NODE_ENV') === 'production' ||
-      (this.config.get<string>('APP_URL') ?? '').startsWith('https://');
+      (this.config.get<string>('APP_URL') ?? '').startsWith('https://') ||
+      (this.config.get<string>('FRONTEND_URL') ?? '').startsWith('https://');
 
     return {
       httpOnly: true,
