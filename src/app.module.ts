@@ -9,6 +9,7 @@ import { AuthModule } from './auth/auth.module';
 import { MailModule } from './mail/mail.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { ProfilesModule } from './profiles/profiles.module';
+import { TierListsModule } from './tier-lists/tier-lists.module';
 
 @Module({
   imports: [
@@ -25,6 +26,7 @@ import { ProfilesModule } from './profiles/profiles.module';
     AuthModule,
     ProfilesModule,
     AdminModule,
+    TierListsModule,
   ],
   controllers: [AppController],
   providers: [

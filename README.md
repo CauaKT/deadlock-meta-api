@@ -122,7 +122,7 @@ docker run --rm -p 3001:3001 --env-file .env deadlock-meta-api
 ### Autenticação (`/auth`)
 | Método | Rota | Acesso | Rate limit | Descrição |
 | --- | --- | --- | --- | --- |
-| `POST` | `/auth/register` | Público | 5 / 60s | Cria usuário + perfil, verifica unicidade de e-mail/nick e envia link de confirmação (ou abre sessão direta se `REQUIRE_EMAIL_VERIFICATION !== "true"`) |
+| `POST` | `/auth/register` | Público | 5 / 60s | Cria usuário + perfil, verifica unicidade de e-mail/nick e sempre envia o link de confirmação; abre sessão direta, exceto com `REQUIRE_EMAIL_VERIFICATION="true"` (nesse caso exige confirmar antes do login) |
 | `POST` | `/auth/login` | Público | 10 / 60s | Valida credenciais e grava cookie `lockpro_session` |
 | `POST` | `/auth/logout` | Público | Global | Limpa o cookie `lockpro_session` |
 | `GET` | `/auth/me` | `JwtAuthGuard` | Global | Retorna dados de sessão e resumo do perfil do usuário autenticado |

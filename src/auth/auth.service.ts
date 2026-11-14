@@ -57,7 +57,7 @@ export class AuthService {
   ) {}
 
   private requireEmailVerification(): boolean {
-    return this.config.get<string>('REQUIRE_EMAIL_VERIFICATION') !== 'false';
+    return this.config.get<string>('REQUIRE_EMAIL_VERIFICATION') === 'true';
   }
 
   private getApiUrl(): string {
@@ -140,7 +140,7 @@ export class AuthService {
         data: {
           email: dto.email,
           passwordHash,
-          emailVerified: !requireVerify,
+          emailVerified: false,
           profile: {
             create: {
               username: dto.username,
@@ -170,10 +170,11 @@ export class AuthService {
       throw err;
     }
 
+    const rawToken = await this.issueToken(createdUser.id, TokenType.EMAIL_VERIFY, 24);
+    const verifyUrl = `${this.getPublicApiUrl()}/auth/verify-email?token=${encodeURIComponent(rawToken)}`;
+    await this.mail.sendVerificationEmail(createdUser.email, verifyUrl);
+
     if (requireVerify) {
-      const rawToken = await this.issueToken(createdUser.id, TokenType.EMAIL_VERIFY, 24);
-      const verifyUrl = `${this.getPublicApiUrl()}/auth/verify-email?token=${encodeURIComponent(rawToken)}`;
-      await this.mail.sendVerificationEmail(createdUser.email, verifyUrl);
       return {
         requiresEmailVerification: true,
         message:
@@ -421,6 +422,15 @@ export class AuthService {
       },
       include: { profile: true },
     });
+
+    // Conta com senha e e-mail não confirmado pode ser de quem cadastrou o e-mail de terceiro: recriar derruba a senha e a sessão dele
+    if (user && !user.googleId && !user.emailVerified && user.passwordHash && user.role === 'USER') {
+      await this.prisma.$transaction([
+        this.prisma.tierList.deleteMany({ where: { userId: user.id } }),
+        this.prisma.user.delete({ where: { id: user.id } }),
+      ]);
+      user = null;
+    }
 
     if (user) {
       user = await this.prisma.user.update({
