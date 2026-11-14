@@ -1,11 +1,22 @@
 import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
+import { ModerationService } from '../moderation/moderation.service';
 import { PrismaService } from '../prisma/prisma.service';
 import type {
   OnboardingDto,
+  SocialLinksDto,
   UpdateProfileLookDto,
   UpdateProfileSettingsDto,
 } from './dto/profiles.dto';
+
+export interface SocialLinksView {
+  steam?: string | null;
+  twitter?: string | null;
+  instagram?: string | null;
+  discord?: string | null;
+  youtube?: string | null;
+  twitch?: string | null;
+}
 
 export interface PublicProfileView {
   id: string;
@@ -16,8 +27,37 @@ export interface PublicProfileView {
   bio: string | null;
   bannerHeroId: number | null;
   bannerImage: string | null;
+  bannerNsfw: boolean;
   profileColor: string | null;
+  socialLinks: SocialLinksView | null;
   createdAt: Date;
+}
+
+function sanitizeSocialLinks(
+  raw: SocialLinksDto | null | undefined,
+): Prisma.InputJsonValue | typeof Prisma.JsonNull | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === null) return Prisma.JsonNull;
+  const cleaned: Record<string, string> = {};
+  const keys = ['steam', 'twitter', 'instagram', 'discord', 'youtube', 'twitch'] as const;
+  for (const key of keys) {
+    const val = raw[key]?.trim();
+    if (val) cleaned[key] = val;
+  }
+  return Object.keys(cleaned).length > 0 ? cleaned : Prisma.JsonNull;
+}
+
+function parseSocialLinks(raw: Prisma.JsonValue | null | undefined): SocialLinksView | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  const out: SocialLinksView = {};
+  const keys = ['steam', 'twitter', 'instagram', 'discord', 'youtube', 'twitch'] as const;
+  for (const key of keys) {
+    if (typeof rec[key] === 'string' && rec[key].trim()) {
+      out[key] = rec[key].trim();
+    }
+  }
+  return Object.keys(out).length > 0 ? out : null;
 }
 
 export interface CommunityProfileView {
@@ -30,7 +70,10 @@ export interface CommunityProfileView {
 
 @Injectable()
 export class ProfilesService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly moderation: ModerationService,
+  ) {}
 
   private async ensureUniqueFields(
     userId: string,
@@ -92,7 +135,9 @@ export class ProfilesService {
             favoriteHeroId: true,
             bannerHeroId: true,
             bannerImage: true,
+            bannerNsfw: true,
             profileColor: true,
+            socialLinks: true,
             updatedAt: true,
           },
         },
@@ -108,6 +153,10 @@ export class ProfilesService {
 
   async completeOnboarding(userId: string, dto: OnboardingDto) {
     await this.ensureUniqueFields(userId, dto.username, dto.handle);
+    await this.moderation.assertSafeContent({
+      texts: [dto.username, dto.handle],
+      images: [dto.avatarUrl],
+    });
 
     try {
       return await this.prisma.profile.upsert({
@@ -131,6 +180,17 @@ export class ProfilesService {
 
   async updateLook(userId: string, dto: UpdateProfileLookDto) {
     await this.ensureUniqueFields(userId, dto.username, dto.handle ?? null);
+    await this.moderation.assertSafeContent({
+      texts: [
+        dto.username,
+        dto.bio,
+        dto.handle,
+        ...(dto.socialLinks ? Object.values(dto.socialLinks) : []),
+      ],
+      images: [dto.avatarUrl],
+    });
+    const { isNsfw: bannerNsfw } = await this.moderation.classifyImage(dto.bannerImage);
+    const socialLinks = sanitizeSocialLinks(dto.socialLinks);
 
     try {
       return await this.prisma.profile.upsert({
@@ -143,7 +203,9 @@ export class ProfilesService {
           avatarUrl: dto.avatarUrl ?? null,
           bannerHeroId: dto.bannerHeroId ?? null,
           bannerImage: dto.bannerImage ?? null,
+          bannerNsfw,
           profileColor: dto.profileColor ?? null,
+          ...(socialLinks !== undefined ? { socialLinks } : {}),
         },
         update: {
           username: dto.username,
@@ -152,7 +214,9 @@ export class ProfilesService {
           avatarUrl: dto.avatarUrl ?? null,
           bannerHeroId: dto.bannerHeroId ?? null,
           bannerImage: dto.bannerImage ?? null,
+          bannerNsfw,
           ...(dto.profileColor !== undefined ? { profileColor: dto.profileColor } : {}),
+          ...(socialLinks !== undefined ? { socialLinks } : {}),
         },
       });
     } catch (err) {
@@ -162,6 +226,15 @@ export class ProfilesService {
 
   async updateSettings(userId: string, dto: UpdateProfileSettingsDto) {
     await this.ensureUniqueFields(userId, dto.username, null);
+    await this.moderation.assertSafeContent({
+      texts: [
+        dto.username,
+        dto.steamId,
+        ...(dto.socialLinks ? Object.values(dto.socialLinks) : []),
+      ],
+    });
+    const { isNsfw: bannerNsfw } = await this.moderation.classifyImage(dto.bannerImage);
+    const socialLinks = sanitizeSocialLinks(dto.socialLinks);
 
     try {
       return await this.prisma.profile.upsert({
@@ -174,6 +247,8 @@ export class ProfilesService {
           favoriteHeroId: dto.favoriteHeroId ?? null,
           bannerHeroId: dto.bannerHeroId ?? null,
           bannerImage: dto.bannerImage ?? null,
+          bannerNsfw,
+          ...(socialLinks !== undefined ? { socialLinks } : {}),
         },
         update: {
           username: dto.username,
@@ -182,6 +257,8 @@ export class ProfilesService {
           favoriteHeroId: dto.favoriteHeroId ?? null,
           bannerHeroId: dto.bannerHeroId ?? null,
           bannerImage: dto.bannerImage ?? null,
+          bannerNsfw,
+          ...(socialLinks !== undefined ? { socialLinks } : {}),
         },
       });
     } catch (err) {
@@ -225,7 +302,9 @@ export class ProfilesService {
         bio: true,
         bannerHeroId: true,
         bannerImage: true,
+        bannerNsfw: true,
         profileColor: true,
+        socialLinks: true,
         createdAt: true,
       },
     });
@@ -234,6 +313,9 @@ export class ProfilesService {
       throw new NotFoundException('Perfil não encontrado.');
     }
 
-    return profile;
+    return {
+      ...profile,
+      socialLinks: parseSocialLinks(profile.socialLinks),
+    };
   }
 }

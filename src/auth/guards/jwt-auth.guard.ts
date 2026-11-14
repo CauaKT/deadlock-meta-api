@@ -48,11 +48,15 @@ export class JwtAuthGuard implements CanActivate {
 
     const user = await this.prisma.user.findUnique({
       where: { id: payload.sub },
-      select: { id: true, email: true, role: true },
+      select: { id: true, email: true, role: true, sessionVersion: true },
     });
 
     if (!user) {
       throw new UnauthorizedException('Usuário não encontrado.');
+    }
+
+    if (typeof payload.sv !== 'number' || payload.sv !== user.sessionVersion) {
+      throw new UnauthorizedException('Sessão revogada. Faça login novamente.');
     }
 
     req.user = {
@@ -84,9 +88,9 @@ export class OptionalJwtAuthGuard implements CanActivate {
       });
       const user = await this.prisma.user.findUnique({
         where: { id: payload.sub },
-        select: { id: true, email: true, role: true },
+        select: { id: true, email: true, role: true, sessionVersion: true },
       });
-      if (user) {
+      if (user && typeof payload.sv === 'number' && payload.sv === user.sessionVersion) {
         req.user = {
           userId: user.id,
           email: user.email,

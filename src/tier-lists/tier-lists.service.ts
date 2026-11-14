@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common';
 import { Prisma, Role } from '@prisma/client';
 import type { AuthenticatedUser } from '../auth/auth.types';
+import { ModerationService } from '../moderation/moderation.service';
 import { PrismaService } from '../prisma/prisma.service';
 import type { CreateTierListDto, TierRowDto, UpdateTierListDto } from './dto/tier-lists.dto';
 
@@ -79,7 +80,10 @@ function sanitizeTiersInput(tiers: TierRowDto[]): Prisma.InputJsonValue {
 
 @Injectable()
 export class TierListsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly moderation: ModerationService,
+  ) {}
 
   private toView(row: TierListWithAuthor, viewer?: AuthenticatedUser): TierListView {
     const isOwner = Boolean(viewer && row.userId && row.userId === viewer.userId);
@@ -168,6 +172,10 @@ export class TierListsService {
   }
 
   async create(user: AuthenticatedUser, dto: CreateTierListDto): Promise<TierListView> {
+    await this.moderation.assertSafeContent({
+      texts: [dto.title, ...dto.tiers.map((t) => t.label)],
+    });
+
     const profile = await this.prisma.profile.findUnique({
       where: { userId: user.userId },
       select: { username: true },
@@ -220,6 +228,10 @@ export class TierListsService {
     if (!existing.userId || existing.userId !== user.userId) {
       throw new ForbiddenException('Apenas o criador pode editar esta tier list.');
     }
+
+    await this.moderation.assertSafeContent({
+      texts: [dto.title, ...dto.tiers.map((t) => t.label)],
+    });
 
     const updated = await this.prisma.tierList.update({
       where: { id },

@@ -3,6 +3,8 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
+  Logger,
+  ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -12,8 +14,11 @@ import type { Role } from '@prisma/client';
 import bcrypt from 'bcryptjs';
 import crypto from 'node:crypto';
 import { MailService } from '../mail/mail.service';
+import { ModerationService } from '../moderation/moderation.service';
 import { PrismaService } from '../prisma/prisma.service';
-import type { JwtPayload } from './auth.types';
+import type { JwtPayload, SavedAccountView } from './auth.types';
+
+const MAX_SAVED_ACCOUNTS = 5;
 import type {
   EmailOnlyDto,
   LoginDto,
@@ -38,6 +43,7 @@ export interface SessionUserView {
   email: string;
   role: Role;
   emailVerified: boolean;
+  mustChangePassword: boolean;
   createdAt: Date;
   profile: {
     username: string | null;
@@ -49,19 +55,18 @@ export interface SessionUserView {
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwt: JwtService,
     private readonly config: ConfigService,
     private readonly mail: MailService,
+    private readonly moderation: ModerationService,
   ) {}
 
   private requireEmailVerification(): boolean {
     return this.config.get<string>('REQUIRE_EMAIL_VERIFICATION') === 'true';
-  }
-
-  private getApiUrl(): string {
-    return (this.config.get<string>('APP_URL') ?? 'http://localhost:3001').replace(/\/+$/, '');
   }
 
   getFrontendUrl(): string {
@@ -106,8 +111,12 @@ export class AuthService {
     return rawToken;
   }
 
-  private async signSessionJwt(userId: string, role: Role): Promise<string> {
-    const payload: JwtPayload = { sub: userId, role };
+  private async signSessionJwt(
+    userId: string,
+    role: Role,
+    sessionVersion: number,
+  ): Promise<string> {
+    const payload: JwtPayload = { sub: userId, role, sv: sessionVersion };
     return this.jwt.signAsync(payload);
   }
 
@@ -131,6 +140,8 @@ export class AuthService {
       throw new ConflictException('Este nick já está em uso. Escolha outro.');
     }
 
+    await this.moderation.assertSafeContent({ texts: [dto.username] });
+
     const passwordHash = await bcrypt.hash(dto.password, 12);
     const requireVerify = this.requireEmailVerification();
 
@@ -152,6 +163,7 @@ export class AuthService {
           email: true,
           role: true,
           emailVerified: true,
+          mustChangePassword: true,
           createdAt: true,
           profile: {
             select: {
@@ -170,9 +182,21 @@ export class AuthService {
       throw err;
     }
 
-    const rawToken = await this.issueToken(createdUser.id, TokenType.EMAIL_VERIFY, 24);
-    const verifyUrl = `${this.getPublicApiUrl()}/auth/verify-email?token=${encodeURIComponent(rawToken)}`;
-    await this.mail.sendVerificationEmail(createdUser.email, verifyUrl);
+    try {
+      const rawToken = await this.issueToken(createdUser.id, TokenType.EMAIL_VERIFY, 24);
+      const verifyUrl = `${this.getPublicApiUrl()}/auth/verify-email?token=${encodeURIComponent(rawToken)}`;
+      await this.mail.sendVerificationEmail(createdUser.email, verifyUrl);
+    } catch (err) {
+      this.logger.error(
+        `Falha ao enviar e-mail de verificação para ${createdUser.email}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      if (requireVerify) {
+        await this.prisma.user.delete({ where: { id: createdUser.id } }).catch(() => {});
+        throw new ServiceUnavailableException(
+          'Não foi possível enviar o e-mail de confirmação. Tente novamente em instantes.',
+        );
+      }
+    }
 
     if (requireVerify) {
       return {
@@ -182,7 +206,7 @@ export class AuthService {
       };
     }
 
-    const accessToken = await this.signSessionJwt(createdUser.id, createdUser.role);
+    const accessToken = await this.signSessionJwt(createdUser.id, createdUser.role, 1);
     return {
       requiresEmailVerification: false,
       accessToken,
@@ -199,6 +223,8 @@ export class AuthService {
         passwordHash: true,
         role: true,
         emailVerified: true,
+        mustChangePassword: true,
+        sessionVersion: true,
         createdAt: true,
         profile: {
           select: {
@@ -226,8 +252,8 @@ export class AuthService {
       );
     }
 
-    const accessToken = await this.signSessionJwt(user.id, user.role);
-    const { passwordHash: _removed, ...userView } = user;
+    const accessToken = await this.signSessionJwt(user.id, user.role, user.sessionVersion);
+    const { passwordHash: _removed, sessionVersion: _sv, ...userView } = user;
     return { accessToken, user: userView };
   }
 
@@ -239,6 +265,7 @@ export class AuthService {
         email: true,
         role: true,
         emailVerified: true,
+        mustChangePassword: true,
         createdAt: true,
         profile: {
           select: {
@@ -256,6 +283,92 @@ export class AuthService {
     }
 
     return user;
+  }
+
+  async changeOwnPassword(
+    userId: string,
+    newPassword: string,
+    currentPassword?: string,
+  ): Promise<{ accessToken: string; user: SessionUserView }> {
+    const existing = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { passwordHash: true, mustChangePassword: true },
+    });
+    if (!existing) {
+      throw new UnauthorizedException('Usuário não encontrado.');
+    }
+    if (existing.passwordHash && !existing.mustChangePassword) {
+      if (!currentPassword) {
+        throw new BadRequestException('Informe sua senha atual.');
+      }
+      const valid = await bcrypt.compare(currentPassword, existing.passwordHash);
+      if (!valid) {
+        throw new UnauthorizedException('Senha atual incorreta.');
+      }
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, 12);
+
+    const [updated] = await this.prisma.$transaction([
+      this.prisma.user.update({
+        where: { id: userId },
+        data: {
+          passwordHash,
+          mustChangePassword: false,
+          sessionVersion: { increment: 1 },
+        },
+        select: {
+          id: true,
+          email: true,
+          role: true,
+          emailVerified: true,
+          mustChangePassword: true,
+          sessionVersion: true,
+          createdAt: true,
+          profile: {
+            select: {
+              username: true,
+              handle: true,
+              avatarUrl: true,
+              favoriteHeroId: true,
+            },
+          },
+        },
+      }),
+      this.prisma.authToken.deleteMany({
+        where: { userId, type: TokenType.PASSWORD_RESET },
+      }),
+    ]);
+
+    const accessToken = await this.signSessionJwt(
+      updated.id,
+      updated.role,
+      updated.sessionVersion,
+    );
+    const { sessionVersion: _sv, ...userView } = updated;
+    return { accessToken, user: userView };
+  }
+
+  async deleteOwnAccount(userId: string): Promise<void> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, role: true },
+    });
+
+    if (!user) {
+      throw new UnauthorizedException('Usuário não encontrado.');
+    }
+
+    if (user.role === 'ADMIN') {
+      const adminCount = await this.prisma.user.count({
+        where: { role: 'ADMIN' },
+      });
+      if (adminCount <= 1) {
+        throw new BadRequestException('Não é possível apagar a conta do último administrador.');
+      }
+    }
+
+    await this.prisma.user.delete({ where: { id: userId } });
   }
 
   async verifyEmailToken(rawToken: string): Promise<void> {
@@ -341,6 +454,7 @@ export class AuthService {
         data: {
           passwordHash,
           emailVerified: true,
+          sessionVersion: { increment: 1 },
         },
       }),
       this.prisma.authToken.deleteMany({
@@ -464,7 +578,11 @@ export class AuthService {
       });
     }
 
-    const accessToken = await this.signSessionJwt(user.id, user.role);
+    const accessToken = await this.signSessionJwt(
+      user.id,
+      user.role,
+      user.sessionVersion,
+    );
     const needsOnboarding =
       !user.profile ||
       !user.profile.username ||
@@ -472,5 +590,119 @@ export class AuthService {
       !user.profile.handle;
 
     return { accessToken, needsOnboarding };
+  }
+
+  private async verifyAccountTokens(tokens: string[]): Promise<{
+    validEntries: Array<{
+      token: string;
+      user: {
+        id: string;
+        email: string;
+        sessionVersion: number;
+        profile: {
+          username: string | null;
+          handle: string | null;
+          avatarUrl: string | null;
+        } | null;
+      };
+    }>;
+    validTokens: string[];
+  }> {
+    const secret = this.config.getOrThrow<string>('JWT_SECRET');
+    const seenSubs = new Set<string>();
+    const decoded: Array<{ token: string; sub: string; sv: number }> = [];
+
+    for (const token of tokens) {
+      if (typeof token !== 'string' || token.length === 0) continue;
+      try {
+        const payload = await this.jwt.verifyAsync<JwtPayload>(token, { secret });
+        if (!payload?.sub || typeof payload.sv !== 'number' || seenSubs.has(payload.sub)) {
+          continue;
+        }
+        seenSubs.add(payload.sub);
+        decoded.push({ token, sub: payload.sub, sv: payload.sv });
+      } catch {
+        // Ignora tokens expirados ou inválidos
+      }
+    }
+
+    if (decoded.length === 0) {
+      return { validEntries: [], validTokens: [] };
+    }
+
+    const users = await this.prisma.user.findMany({
+      where: { id: { in: decoded.map((d) => d.sub) } },
+      select: {
+        id: true,
+        email: true,
+        sessionVersion: true,
+        profile: {
+          select: {
+            username: true,
+            handle: true,
+            avatarUrl: true,
+          },
+        },
+      },
+    });
+    const byId = new Map(users.map((u) => [u.id, u]));
+
+    const validEntries: Array<{
+      token: string;
+      user: (typeof users)[number];
+    }> = [];
+
+    for (const item of decoded) {
+      const user = byId.get(item.sub);
+      if (user && user.sessionVersion === item.sv) {
+        validEntries.push({ token: item.token, user });
+      }
+    }
+
+    return {
+      validEntries,
+      validTokens: validEntries.map((e) => e.token),
+    };
+  }
+
+  async mergeAccountToken(existingTokens: string[], newToken: string): Promise<string[]> {
+    const { validTokens } = await this.verifyAccountTokens([newToken, ...existingTokens]);
+    return validTokens.slice(0, MAX_SAVED_ACCOUNTS);
+  }
+
+  async removeAccountToken(existingTokens: string[], targetUserId: string): Promise<string[]> {
+    const { validEntries } = await this.verifyAccountTokens(existingTokens);
+    return validEntries
+      .filter((entry) => entry.user.id !== targetUserId)
+      .map((entry) => entry.token);
+  }
+
+  async listSavedAccounts(
+    tokens: string[],
+    activeUserId?: string,
+  ): Promise<{ accounts: SavedAccountView[]; validTokens: string[] }> {
+    const { validEntries, validTokens } = await this.verifyAccountTokens(tokens);
+    return {
+      validTokens,
+      accounts: validEntries.map((entry) => ({
+        id: entry.user.id,
+        email: entry.user.email,
+        username: entry.user.profile?.username ?? null,
+        handle: entry.user.profile?.handle ?? null,
+        avatarUrl: entry.user.profile?.avatarUrl ?? null,
+        isCurrent: entry.user.id === activeUserId,
+      })),
+    };
+  }
+
+  async resolveSwitchToken(tokens: string[], targetUserId: string): Promise<string> {
+    const { validEntries } = await this.verifyAccountTokens(tokens);
+    const match = validEntries.find((entry) => entry.user.id === targetUserId);
+    if (!match) {
+      throw new UnauthorizedException(
+        'A sessão desta conta expirou ou foi revogada. Faça login novamente.',
+      );
+    }
+    return match.token;
   }
 }

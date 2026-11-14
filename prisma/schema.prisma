@@ -23,8 +23,10 @@ model User {
   email         String      @unique
   passwordHash  String?     @map("password_hash")
   googleId      String?     @unique @map("google_id")
-  role          Role        @default(USER)
-  emailVerified Boolean     @default(false) @map("email_verified")
+  role               Role        @default(USER)
+  emailVerified      Boolean     @default(false) @map("email_verified")
+  mustChangePassword Boolean     @default(false) @map("must_change_password")
+  sessionVersion     Int         @default(1) @map("session_version")
   profile       Profile?
   tierLists     TierList[]
   authTokens    AuthToken[]
@@ -59,7 +61,9 @@ model Profile {
   favoriteHeroId Int?     @map("favorite_hero_id")
   bannerHeroId   Int?     @map("banner_hero_id")
   bannerImage    String?  @map("banner_image")
+  bannerNsfw     Boolean  @default(false) @map("banner_nsfw")
   profileColor   String?  @map("profile_color")
+  socialLinks    Json?    @map("social_links")
   createdAt      DateTime @default(now()) @map("created_at")
   updatedAt      DateTime @updatedAt @map("updated_at")
 

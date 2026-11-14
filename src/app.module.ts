@@ -7,6 +7,7 @@ import { AppService } from './app.service';
 import { AdminModule } from './admin/admin.module';
 import { AuthModule } from './auth/auth.module';
 import { MailModule } from './mail/mail.module';
+import { ModerationModule } from './moderation/moderation.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { ProfilesModule } from './profiles/profiles.module';
 import { TierListsModule } from './tier-lists/tier-lists.module';
@@ -22,6 +23,7 @@ import { TierListsModule } from './tier-lists/tier-lists.module';
       },
     ]),
     PrismaModule,
+    ModerationModule,
     MailModule,
     AuthModule,
     ProfilesModule,

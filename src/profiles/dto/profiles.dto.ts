@@ -1,4 +1,4 @@
-import { Transform } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import {
   IsInt,
   IsOptional,
@@ -8,6 +8,7 @@ import {
   MaxLength,
   Min,
   ValidateIf,
+  ValidateNested,
 } from 'class-validator';
 
 const SAFE_IMAGE_REGEX =
@@ -30,6 +31,50 @@ const normalizeHandle = ({ value }: { value: unknown }): unknown => {
   const trimmed = value.trim().toLowerCase();
   return trimmed === '' ? null : trimmed;
 };
+
+export class SocialLinksDto {
+  @IsOptional()
+  @Transform(emptyToNull)
+  @ValidateIf((_obj, v) => v !== null && v !== undefined)
+  @IsString()
+  @MaxLength(120, { message: 'Link da Steam muito longo.' })
+  steam?: string | null;
+
+  @IsOptional()
+  @Transform(emptyToNull)
+  @ValidateIf((_obj, v) => v !== null && v !== undefined)
+  @IsString()
+  @MaxLength(120, { message: 'Usuário/link do X (Twitter) muito longo.' })
+  twitter?: string | null;
+
+  @IsOptional()
+  @Transform(emptyToNull)
+  @ValidateIf((_obj, v) => v !== null && v !== undefined)
+  @IsString()
+  @MaxLength(120, { message: 'Usuário/link do Instagram muito longo.' })
+  instagram?: string | null;
+
+  @IsOptional()
+  @Transform(emptyToNull)
+  @ValidateIf((_obj, v) => v !== null && v !== undefined)
+  @IsString()
+  @MaxLength(64, { message: 'Usuário/convite do Discord muito longo.' })
+  discord?: string | null;
+
+  @IsOptional()
+  @Transform(emptyToNull)
+  @ValidateIf((_obj, v) => v !== null && v !== undefined)
+  @IsString()
+  @MaxLength(120, { message: 'Canal/link do YouTube muito longo.' })
+  youtube?: string | null;
+
+  @IsOptional()
+  @Transform(emptyToNull)
+  @ValidateIf((_obj, v) => v !== null && v !== undefined)
+  @IsString()
+  @MaxLength(120, { message: 'Canal/link da Twitch muito longo.' })
+  twitch?: string | null;
+}
 
 export class OnboardingDto {
   @Transform(trimString)
@@ -109,6 +154,12 @@ export class UpdateProfileLookDto {
   @IsString()
   @Matches(/^#[0-9a-fA-F]{6}$/, { message: 'Cor de perfil inválida.' })
   profileColor?: string | null;
+
+  @IsOptional()
+  @ValidateIf((_obj, v) => v !== null && v !== undefined)
+  @ValidateNested()
+  @Type(() => SocialLinksDto)
+  socialLinks?: SocialLinksDto | null;
 }
 
 export class UpdateProfileSettingsDto {
@@ -153,4 +204,10 @@ export class UpdateProfileSettingsDto {
   @MaxLength(600_000, { message: 'Imagem de banner excede o tamanho permitido.' })
   @Matches(SAFE_DATA_IMAGE_REGEX, { message: 'Formato de banner inválido.' })
   bannerImage?: string | null;
+
+  @IsOptional()
+  @ValidateIf((_obj, v) => v !== null && v !== undefined)
+  @ValidateNested()
+  @Type(() => SocialLinksDto)
+  socialLinks?: SocialLinksDto | null;
 }

@@ -1,5 +1,5 @@
 import { Transform } from 'class-transformer';
-import { IsEmail, IsString, Length, Matches, MaxLength, MinLength } from 'class-validator';
+import { IsEmail, IsOptional, IsString, IsUUID, Length, Matches, MaxLength, MinLength } from 'class-validator';
 
 const trimValue = ({ value }: { value: unknown }): unknown =>
   typeof value === 'string' ? value.trim() : value;
@@ -56,6 +56,23 @@ export class ResetPasswordDto {
   @IsString()
   @MinLength(16, { message: 'Token inválido.' })
   token: string;
+
+  @IsString()
+  @MinLength(8, { message: 'A senha precisa ter pelo menos 8 caracteres.' })
+  @MaxLength(128, { message: 'A senha deve ter no máximo 128 caracteres.' })
+  newPassword: string;
+}
+
+export class SwitchAccountDto {
+  @IsUUID(undefined, { message: 'ID de conta inválido.' })
+  userId: string;
+}
+
+export class ChangePasswordDto {
+  @IsOptional()
+  @IsString()
+  @MaxLength(128)
+  currentPassword?: string;
 
   @IsString()
   @MinLength(8, { message: 'A senha precisa ter pelo menos 8 caracteres.' })

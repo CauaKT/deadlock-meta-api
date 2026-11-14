@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   HttpCode,
   HttpStatus,
@@ -17,19 +18,22 @@ import crypto from 'node:crypto';
 import { AuthService } from './auth.service';
 import type { SessionUserView } from './auth.service';
 import {
+  ACCOUNTS_COOKIE_NAME,
   OAUTH_STATE_COOKIE_NAME,
   SESSION_COOKIE_NAME,
 } from './auth.types';
-import type { AuthenticatedUser } from './auth.types';
+import type { AuthenticatedUser, SavedAccountView } from './auth.types';
 import { CurrentUser } from './decorators/current-user.decorator';
 import {
+  ChangePasswordDto,
   EmailOnlyDto,
   LoginDto,
   RegisterDto,
   ResetPasswordDto,
+  SwitchAccountDto,
   VerifyEmailDto,
 } from './dto/auth.dto';
-import { JwtAuthGuard } from './guards/jwt-auth.guard';
+import { JwtAuthGuard, OptionalJwtAuthGuard } from './guards/jwt-auth.guard';
 
 @Controller('auth')
 export class AuthController {
@@ -58,15 +62,42 @@ export class AuthController {
     return rest;
   }
 
+  private readAccountTokens(req: Request): string[] {
+    const cookies = req.cookies as Record<string, unknown> | undefined;
+    const raw = cookies?.[ACCOUNTS_COOKIE_NAME];
+    if (typeof raw !== 'string' || !raw) return [];
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter((item): item is string => typeof item === 'string' && item.length > 0);
+    } catch {
+      return [];
+    }
+  }
+
+  private writeAccountsCookie(res: Response, tokens: string[]): void {
+    if (tokens.length === 0) {
+      res.clearCookie(ACCOUNTS_COOKIE_NAME, this.clearCookieOptions());
+      return;
+    }
+    res.cookie(ACCOUNTS_COOKIE_NAME, JSON.stringify(tokens), this.sessionCookieOptions());
+  }
+
   @Throttle({ default: { limit: 5, ttl: 60000 } })
   @Post('register')
   async register(
     @Body() dto: RegisterDto,
+    @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ) {
     const result = await this.authService.register(dto);
     if (!result.requiresEmailVerification) {
       res.cookie(SESSION_COOKIE_NAME, result.accessToken, this.sessionCookieOptions());
+      const updated = await this.authService.mergeAccountToken(
+        this.readAccountTokens(req),
+        result.accessToken,
+      );
+      this.writeAccountsCookie(res, updated);
       return {
         requiresEmailVerification: false,
         user: result.user,
@@ -80,17 +111,108 @@ export class AuthController {
   @Post('login')
   async login(
     @Body() dto: LoginDto,
+    @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ): Promise<{ user: SessionUserView }> {
     const { accessToken, user } = await this.authService.login(dto);
     res.cookie(SESSION_COOKIE_NAME, accessToken, this.sessionCookieOptions());
+    const updated = await this.authService.mergeAccountToken(
+      this.readAccountTokens(req),
+      accessToken,
+    );
+    this.writeAccountsCookie(res, updated);
     return { user };
   }
 
+  @UseGuards(OptionalJwtAuthGuard)
   @HttpCode(HttpStatus.OK)
   @Post('logout')
-  logout(@Res({ passthrough: true }) res: Response): { ok: true } {
+  async logout(
+    @CurrentUser() user: AuthenticatedUser | undefined,
+    @Query('keepAccount') keepAccount: string | undefined,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<{ ok: true }> {
     res.clearCookie(SESSION_COOKIE_NAME, this.clearCookieOptions());
+    if (user && keepAccount !== '1') {
+      const updated = await this.authService.removeAccountToken(
+        this.readAccountTokens(req),
+        user.userId,
+      );
+      this.writeAccountsCookie(res, updated);
+    }
+    return { ok: true };
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Get('accounts')
+  async accounts(
+    @CurrentUser() user: AuthenticatedUser,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<{ accounts: SavedAccountView[] }> {
+    const currentTokens = this.readAccountTokens(req);
+    const { accounts, validTokens } = await this.authService.listSavedAccounts(
+      currentTokens,
+      user.userId,
+    );
+    if (validTokens.length !== currentTokens.length) {
+      this.writeAccountsCookie(res, validTokens);
+    }
+    return { accounts };
+  }
+
+  @HttpCode(HttpStatus.OK)
+  @Post('switch-account')
+  async switchAccount(
+    @Body() dto: SwitchAccountDto,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<{ ok: true }> {
+    const token = await this.authService.resolveSwitchToken(
+      this.readAccountTokens(req),
+      dto.userId,
+    );
+    res.cookie(SESSION_COOKIE_NAME, token, this.sessionCookieOptions());
+    return { ok: true };
+  }
+
+  @UseGuards(OptionalJwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  @Post('accounts/remove')
+  async removeAccount(
+    @Body() dto: SwitchAccountDto,
+    @CurrentUser() user: AuthenticatedUser | undefined,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<{ ok: true; removedCurrent: boolean }> {
+    const updated = await this.authService.removeAccountToken(
+      this.readAccountTokens(req),
+      dto.userId,
+    );
+    this.writeAccountsCookie(res, updated);
+    const removedCurrent = user?.userId === dto.userId;
+    if (removedCurrent) {
+      res.clearCookie(SESSION_COOKIE_NAME, this.clearCookieOptions());
+    }
+    return { ok: true, removedCurrent };
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  @Delete('me')
+  async deleteMe(
+    @CurrentUser() user: AuthenticatedUser,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<{ ok: true }> {
+    await this.authService.deleteOwnAccount(user.userId);
+    res.clearCookie(SESSION_COOKIE_NAME, this.clearCookieOptions());
+    const updated = await this.authService.removeAccountToken(
+      this.readAccountTokens(req),
+      user.userId,
+    );
+    this.writeAccountsCookie(res, updated);
     return { ok: true };
   }
 
@@ -147,6 +269,29 @@ export class AuthController {
   @Post('reset-password')
   async resetPassword(@Body() dto: ResetPasswordDto) {
     return this.authService.resetPassword(dto);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  @Post('change-password')
+  async changePassword(
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() dto: ChangePasswordDto,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<{ user: SessionUserView }> {
+    const { accessToken, user: updatedUser } = await this.authService.changeOwnPassword(
+      user.userId,
+      dto.newPassword,
+      dto.currentPassword,
+    );
+    res.cookie(SESSION_COOKIE_NAME, accessToken, this.sessionCookieOptions());
+    const updated = await this.authService.mergeAccountToken(
+      this.readAccountTokens(req),
+      accessToken,
+    );
+    this.writeAccountsCookie(res, updated);
+    return { user: updatedUser };
   }
 
   @Throttle({ default: { limit: 15, ttl: 60000 } })
@@ -207,6 +352,11 @@ export class AuthController {
     try {
       const { accessToken, needsOnboarding } = await this.authService.handleGoogleCallback(code);
       res.cookie(SESSION_COOKIE_NAME, accessToken, this.sessionCookieOptions());
+      const updated = await this.authService.mergeAccountToken(
+        this.readAccountTokens(req),
+        accessToken,
+      );
+      this.writeAccountsCookie(res, updated);
       const safeNext =
         parsed.next && parsed.next.startsWith('/') && !parsed.next.startsWith('//')
           ? parsed.next
