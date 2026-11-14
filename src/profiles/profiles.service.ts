@@ -266,12 +266,26 @@ export class ProfilesService {
     }
   }
 
-  async getCommunity(excludeUserId?: string, limit = 8): Promise<CommunityProfileView[]> {
-    const safeLimit = Math.min(20, Math.max(1, Math.trunc(limit) || 8));
+  async getCommunity(
+    excludeUserId?: string,
+    limit = 8,
+    search?: string,
+  ): Promise<CommunityProfileView[]> {
+    const safeLimit = Math.min(100, Math.max(1, Math.trunc(limit) || 8));
+    const q = search?.trim().replace(/^@+/, '');
+
     return this.prisma.profile.findMany({
       where: {
         handle: { not: null },
         ...(excludeUserId ? { userId: { not: excludeUserId } } : {}),
+        ...(q
+          ? {
+              OR: [
+                { username: { contains: q, mode: 'insensitive' } },
+                { handle: { contains: q, mode: 'insensitive' } },
+              ],
+            }
+          : {}),
       },
       select: {
         id: true,
@@ -280,7 +294,7 @@ export class ProfilesService {
         avatarUrl: true,
         favoriteHeroId: true,
       },
-      orderBy: { updatedAt: 'desc' },
+      orderBy: q ? { username: 'asc' } : { updatedAt: 'desc' },
       take: safeLimit,
     });
   }

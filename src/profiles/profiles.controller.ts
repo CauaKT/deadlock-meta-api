@@ -60,9 +60,14 @@ export class ProfilesController {
   async community(
     @CurrentUser() user: AuthenticatedUser | undefined,
     @Query('limit') limit?: string,
+    @Query('search') search?: string,
   ) {
     const parsed = limit ? Number(limit) : 8;
-    return this.profilesService.getCommunity(user?.userId, Number.isFinite(parsed) ? parsed : 8);
+    return this.profilesService.getCommunity(
+      user?.userId,
+      Number.isFinite(parsed) ? parsed : 8,
+      search,
+    );
   }
 
   @UseGuards(OptionalJwtAuthGuard)
