@@ -5,6 +5,7 @@ import {
   Get,
   HttpCode,
   HttpStatus,
+  Logger,
   Post,
   Query,
   Req,
@@ -37,6 +38,8 @@ import { JwtAuthGuard, OptionalJwtAuthGuard } from './guards/jwt-auth.guard';
 
 @Controller('auth')
 export class AuthController {
+  private readonly logger = new Logger(AuthController.name);
+
   constructor(
     private readonly authService: AuthService,
     private readonly config: ConfigService,
@@ -332,6 +335,9 @@ export class AuthController {
     res.clearCookie(OAUTH_STATE_COOKIE_NAME, this.clearCookieOptions());
 
     if (!code || !state || typeof rawCookie !== 'string') {
+      this.logger.warn(
+        `Google callback inválido: hasCode=${Boolean(code)} hasState=${Boolean(state)} hasCookie=${typeof rawCookie === 'string'}`,
+      );
       res.redirect(`${front}/login?error=auth-callback-failed`);
       return;
     }
@@ -340,11 +346,13 @@ export class AuthController {
     try {
       parsed = JSON.parse(rawCookie) as { state?: string; next?: string };
     } catch {
+      this.logger.warn('Google callback falhou: cookie OAuth state malformado');
       res.redirect(`${front}/login?error=auth-callback-failed`);
       return;
     }
 
     if (!parsed.state || parsed.state !== state) {
+      this.logger.warn('Google callback falhou: state mismatch');
       res.redirect(`${front}/login?error=auth-callback-failed`);
       return;
     }
@@ -362,7 +370,10 @@ export class AuthController {
           ? parsed.next
           : '/';
       res.redirect(needsOnboarding ? `${front}/welcome` : `${front}${safeNext}`);
-    } catch {
+    } catch (err) {
+      this.logger.warn(
+        `Google callback exceção: ${err instanceof Error ? err.message : String(err)}`,
+      );
       res.redirect(`${front}/login?error=auth-callback-failed`);
     }
   }

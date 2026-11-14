@@ -506,7 +506,10 @@ export class AuthService {
     });
 
     if (!tokenRes.ok) {
-      throw new UnauthorizedException('Falha ao trocar código com o Google.');
+      const errBody = await tokenRes.text().catch(() => '');
+      throw new UnauthorizedException(
+        `Falha ao trocar código com o Google (${tokenRes.status}): ${errBody}`,
+      );
     }
 
     const tokenData = (await tokenRes.json()) as GoogleTokenResponse;
