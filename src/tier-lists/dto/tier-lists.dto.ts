@@ -4,11 +4,9 @@ import {
   ArrayMinSize,
   IsArray,
   IsInt,
-  IsOptional,
   IsString,
   Length,
   Matches,
-  MaxLength,
   Min,
   ValidateNested,
 } from 'class-validator';
@@ -41,12 +39,6 @@ export class CreateTierListDto {
   @IsString({ message: 'Título inválido.' })
   @Length(1, 80, { message: 'Título deve ter entre 1 e 80 caracteres.' })
   title!: string;
-
-  @IsOptional()
-  @Transform(trimString)
-  @IsString({ message: 'Nome do autor inválido.' })
-  @MaxLength(40, { message: 'Nome do autor deve ter no máximo 40 caracteres.' })
-  authorName?: string;
 
   @IsArray({ message: 'Tiers inválidos.' })
   @ArrayMinSize(1, { message: 'A tier list precisa ter pelo menos 1 categoria.' })

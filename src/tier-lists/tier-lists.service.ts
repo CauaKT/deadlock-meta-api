@@ -175,7 +175,6 @@ export class TierListsService {
 
     const authorName =
       profile?.username?.trim() ||
-      dto.authorName?.trim() ||
       user.email.split('@')[0] ||
       'Anônimo';
 
@@ -226,7 +225,6 @@ export class TierListsService {
       where: { id },
       data: {
         title: dto.title,
-        ...(dto.authorName ? { authorName: dto.authorName } : {}),
         tiers: sanitizeTiersInput(dto.tiers),
       },
       include: {
