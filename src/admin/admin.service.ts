@@ -1,8 +1,14 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { Role, TokenType } from '@prisma/client';
-import bcrypt from 'bcryptjs';
+import { Role } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import type { AdminResetPasswordDto } from './dto/admin.dto';
+
+// LGPD: o painel nunca recebe o e-mail completo (ex.: "be***@gmail.com")
+function maskEmail(email: string): string {
+  const at = email.lastIndexOf('@');
+  if (at < 1) return '***';
+  const local = email.slice(0, at);
+  return `${local.slice(0, local.length <= 2 ? 1 : 2)}***${email.slice(at)}`;
+}
 
 @Injectable()
 export class AdminService {
@@ -50,85 +56,8 @@ export class AdminService {
       page: safePage,
       limit: safeLimit,
       total,
-      items,
+      items: items.map((u) => ({ ...u, email: maskEmail(u.email) })),
     };
-  }
-
-  async updateUserRole(targetUserId: string, role: Role) {
-    const target = await this.prisma.user.findUnique({
-      where: { id: targetUserId },
-      select: { id: true, email: true, role: true },
-    });
-
-    if (!target) {
-      throw new NotFoundException('Usuário não encontrado.');
-    }
-
-    if (target.role === Role.ADMIN && role !== Role.ADMIN) {
-      const adminCount = await this.prisma.user.count({
-        where: { role: Role.ADMIN },
-      });
-      if (adminCount <= 1) {
-        throw new BadRequestException('Não é possível rebaixar o último administrador.');
-      }
-    }
-
-    return this.prisma.user.update({
-      where: { id: targetUserId },
-      data: target.role !== role ? { role, sessionVersion: { increment: 1 } } : { role },
-      select: {
-        id: true,
-        email: true,
-        role: true,
-      },
-    });
-  }
-
-  async resetUserPassword(targetUserId: string, dto: AdminResetPasswordDto) {
-    const target = await this.prisma.user.findUnique({
-      where: { id: targetUserId },
-      select: { id: true, email: true },
-    });
-
-    if (!target) {
-      throw new NotFoundException('Usuário não encontrado.');
-    }
-
-    if (dto.letUserChoose) {
-      await this.prisma.user.update({
-        where: { id: targetUserId },
-        data: {
-          mustChangePassword: true,
-          sessionVersion: { increment: 1 },
-        },
-      });
-      return { ok: true, email: target.email, letUserChoose: true };
-    }
-
-    if (!dto.newPassword) {
-      throw new BadRequestException('Informe uma nova senha ou escolha deixar o usuário definir.');
-    }
-
-    const passwordHash = await bcrypt.hash(dto.newPassword, 12);
-
-    await this.prisma.$transaction([
-      this.prisma.user.update({
-        where: { id: targetUserId },
-        data: {
-          passwordHash,
-          mustChangePassword: false,
-          sessionVersion: { increment: 1 },
-        },
-      }),
-      this.prisma.authToken.deleteMany({
-        where: {
-          userId: targetUserId,
-          type: TokenType.PASSWORD_RESET,
-        },
-      }),
-    ]);
-
-    return { ok: true, email: target.email, letUserChoose: false };
   }
 
   async deleteUser(targetUserId: string, actorUserId: string) {
@@ -158,7 +87,7 @@ export class AdminService {
       where: { id: targetUserId },
     });
 
-    return { ok: true, email: target.email };
+    return { ok: true, email: maskEmail(target.email) };
   }
 
   async getSystemOverview() {

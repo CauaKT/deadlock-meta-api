@@ -6,6 +6,8 @@ import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { AdminModule } from './admin/admin.module';
 import { AuthModule } from './auth/auth.module';
+import { FeedModule } from './feed/feed.module';
+import { FriendsModule } from './friends/friends.module';
 import { MailModule } from './mail/mail.module';
 import { ModerationModule } from './moderation/moderation.module';
 import { PrismaModule } from './prisma/prisma.module';
@@ -29,6 +31,8 @@ import { TierListsModule } from './tier-lists/tier-lists.module';
     ProfilesModule,
     AdminModule,
     TierListsModule,
+    FeedModule,
+    FriendsModule,
   ],
   controllers: [AppController],
   providers: [

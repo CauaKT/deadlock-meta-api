@@ -465,6 +465,167 @@ export class AuthService {
     return { ok: true, message: 'Senha redefinida com sucesso!' };
   }
 
+  private emailChangeHash(userId: string, newEmail: string, code: string): string {
+    return crypto.createHash('sha256').update(`${userId}:${newEmail}:${code}`).digest('hex');
+  }
+
+  async requestEmailChange(
+    userId: string,
+    newEmail: string,
+    password: string,
+  ): Promise<{ ok: true; message: string }> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, email: true, passwordHash: true, mustChangePassword: true },
+    });
+    if (!user) {
+      throw new UnauthorizedException('Usuário não encontrado.');
+    }
+    if (!user.passwordHash || user.mustChangePassword) {
+      throw new BadRequestException(
+        'Defina uma senha para a sua conta antes de trocar o e-mail.',
+      );
+    }
+    const validPassword = await bcrypt.compare(password, user.passwordHash);
+    if (!validPassword) {
+      throw new UnauthorizedException('Senha incorreta.');
+    }
+    if (newEmail === user.email) {
+      throw new BadRequestException('Este já é o e-mail atual da sua conta.');
+    }
+
+    const taken = await this.prisma.user.findUnique({
+      where: { email: newEmail },
+      select: { id: true },
+    });
+    if (taken) {
+      throw new ConflictException('Este e-mail já está em uso por outra conta.');
+    }
+
+    const last = await this.prisma.authToken.findFirst({
+      where: { userId, type: TokenType.EMAIL_CHANGE },
+      select: { createdAt: true },
+    });
+    if (last && Date.now() - last.createdAt.getTime() < 60_000) {
+      throw new BadRequestException('Aguarde um minuto para pedir um novo código.');
+    }
+
+    const code = crypto.randomInt(0, 1_000_000).toString().padStart(6, '0');
+    const tokenHash = this.emailChangeHash(userId, newEmail, code);
+
+    await this.prisma.$transaction([
+      this.prisma.authToken.deleteMany({ where: { userId, type: TokenType.EMAIL_CHANGE } }),
+      this.prisma.authToken.create({
+        data: {
+          userId,
+          type: TokenType.EMAIL_CHANGE,
+          tokenHash,
+          payload: newEmail,
+          expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+        },
+      }),
+    ]);
+
+    try {
+      await this.mail.sendEmailChangeCode(newEmail, code);
+    } catch (err) {
+      this.logger.error(
+        `Falha ao enviar código de troca de e-mail: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      await this.prisma.authToken
+        .deleteMany({ where: { userId, type: TokenType.EMAIL_CHANGE } })
+        .catch(() => {});
+      throw new ServiceUnavailableException(
+        'Não foi possível enviar o código. Tente novamente em instantes.',
+      );
+    }
+
+    return {
+      ok: true,
+      message: 'Enviamos um código de 6 dígitos para o novo e-mail. Ele vale por 15 minutos.',
+    };
+  }
+
+  async confirmEmailChange(
+    userId: string,
+    code: string,
+  ): Promise<{ accessToken: string; user: SessionUserView }> {
+    const record = await this.prisma.authToken.findFirst({
+      where: { userId, type: TokenType.EMAIL_CHANGE },
+    });
+    if (!record || !record.payload || record.expiresAt < new Date()) {
+      throw new BadRequestException('Código inválido ou expirado. Peça um novo código.');
+    }
+    if (record.attempts >= 5) {
+      await this.prisma.authToken.deleteMany({ where: { userId, type: TokenType.EMAIL_CHANGE } });
+      throw new BadRequestException('Muitas tentativas. Peça um novo código.');
+    }
+
+    const expected = Buffer.from(this.emailChangeHash(userId, record.payload, code));
+    const stored = Buffer.from(record.tokenHash);
+    if (expected.length !== stored.length || !crypto.timingSafeEqual(expected, stored)) {
+      await this.prisma.authToken.update({
+        where: { id: record.id },
+        data: { attempts: { increment: 1 } },
+      });
+      throw new BadRequestException('Código incorreto.');
+    }
+
+    const oldEmail = (
+      await this.prisma.user.findUnique({ where: { id: userId }, select: { email: true } })
+    )?.email;
+
+    let updated;
+    try {
+      [updated] = await this.prisma.$transaction([
+        this.prisma.user.update({
+          where: { id: userId },
+          data: {
+            email: record.payload,
+            emailVerified: true,
+            sessionVersion: { increment: 1 },
+          },
+          select: {
+            id: true,
+            email: true,
+            role: true,
+            emailVerified: true,
+            mustChangePassword: true,
+            sessionVersion: true,
+            createdAt: true,
+            profile: {
+              select: {
+                username: true,
+                handle: true,
+                avatarUrl: true,
+                favoriteHeroId: true,
+              },
+            },
+          },
+        }),
+        this.prisma.authToken.deleteMany({
+          where: {
+            userId,
+            type: { in: [TokenType.EMAIL_CHANGE, TokenType.EMAIL_VERIFY] },
+          },
+        }),
+      ]);
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        throw new ConflictException('Este e-mail já está em uso por outra conta.');
+      }
+      throw err;
+    }
+
+    if (oldEmail && oldEmail !== updated.email) {
+      this.mail.sendEmailChangedNotice(oldEmail, updated.email).catch(() => {});
+    }
+
+    const { sessionVersion, ...userView } = updated;
+    const accessToken = await this.signSessionJwt(updated.id, updated.role, sessionVersion);
+    return { accessToken, user: userView };
+  }
+
   buildGoogleAuthorizeUrl(state: string): string | null {
     const clientId = this.config.get<string>('GOOGLE_CLIENT_ID')?.trim();
     const clientSecret = this.config.get<string>('GOOGLE_CLIENT_SECRET')?.trim();

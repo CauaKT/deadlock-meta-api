@@ -79,3 +79,22 @@ export class ChangePasswordDto {
   @MaxLength(128, { message: 'A senha deve ter no máximo 128 caracteres.' })
   newPassword: string;
 }
+
+export class RequestEmailChangeDto {
+  @Transform(normalizeEmail)
+  @IsEmail({}, { message: 'Informe um e-mail válido.' })
+  @MaxLength(254)
+  newEmail: string;
+
+  @IsString()
+  @MinLength(1, { message: 'Informe sua senha.' })
+  @MaxLength(128)
+  password: string;
+}
+
+export class ConfirmEmailChangeDto {
+  @Transform(trimValue)
+  @IsString()
+  @Matches(/^\d{6}$/, { message: 'O código tem 6 dígitos.' })
+  code: string;
+}

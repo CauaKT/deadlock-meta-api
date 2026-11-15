@@ -27,9 +27,11 @@ import type { AuthenticatedUser, SavedAccountView } from './auth.types';
 import { CurrentUser } from './decorators/current-user.decorator';
 import {
   ChangePasswordDto,
+  ConfirmEmailChangeDto,
   EmailOnlyDto,
   LoginDto,
   RegisterDto,
+  RequestEmailChangeDto,
   ResetPasswordDto,
   SwitchAccountDto,
   VerifyEmailDto,
@@ -287,6 +289,40 @@ export class AuthController {
       user.userId,
       dto.newPassword,
       dto.currentPassword,
+    );
+    res.cookie(SESSION_COOKIE_NAME, accessToken, this.sessionCookieOptions());
+    const updated = await this.authService.mergeAccountToken(
+      this.readAccountTokens(req),
+      accessToken,
+    );
+    this.writeAccountsCookie(res, updated);
+    return { user: updatedUser };
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Throttle({ default: { limit: 3, ttl: 60000 } })
+  @HttpCode(HttpStatus.OK)
+  @Post('email-change/request')
+  async requestEmailChange(
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() dto: RequestEmailChangeDto,
+  ): Promise<{ ok: true; message: string }> {
+    return this.authService.requestEmailChange(user.userId, dto.newEmail, dto.password);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Throttle({ default: { limit: 5, ttl: 60000 } })
+  @HttpCode(HttpStatus.OK)
+  @Post('email-change/confirm')
+  async confirmEmailChange(
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() dto: ConfirmEmailChangeDto,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<{ user: SessionUserView }> {
+    const { accessToken, user: updatedUser } = await this.authService.confirmEmailChange(
+      user.userId,
+      dto.code,
     );
     res.cookie(SESSION_COOKIE_NAME, accessToken, this.sessionCookieOptions());
     const updated = await this.authService.mergeAccountToken(

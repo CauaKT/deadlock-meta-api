@@ -77,6 +77,34 @@ export class MailService {
     await this.send(to, subject, text, html, resetUrl);
   }
 
+  async sendEmailChangeCode(to: string, code: string): Promise<void> {
+    const subject = 'LockPro — Código para trocar seu e-mail';
+    const text = `Seu código de confirmação do LockPro é ${code}. Ele vale por 15 minutos.\n\nSe você não pediu a troca de e-mail, ignore esta mensagem.`;
+    const html = `
+      <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:24px;background:#0a0d0c;color:#f4efe6;border-radius:12px;border:1px solid #262626">
+        <h2 style="margin:0 0 12px;color:#f59e0b">Confirme seu novo e-mail</h2>
+        <p style="margin:0 0 16px;color:#d4d4d4;font-size:14px">Use o código abaixo no LockPro. Ele expira em 15 minutos.</p>
+        <p style="margin:0 0 20px;font-size:32px;font-weight:bold;letter-spacing:8px;color:#f59e0b">${code}</p>
+        <p style="margin:0;color:#737373;font-size:12px">Se você não pediu essa alteração, ignore este e-mail.</p>
+      </div>
+    `;
+
+    await this.send(to, subject, text, html, code);
+  }
+
+  async sendEmailChangedNotice(to: string, newEmail: string): Promise<void> {
+    const subject = 'LockPro — Seu e-mail foi alterado';
+    const text = `O e-mail da sua conta no LockPro foi alterado para ${newEmail}. Se não foi você, redefina sua senha imediatamente.`;
+    const html = `
+      <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:24px;background:#0a0d0c;color:#f4efe6;border-radius:12px;border:1px solid #262626">
+        <h2 style="margin:0 0 12px;color:#f59e0b">E-mail da conta alterado</h2>
+        <p style="margin:0;color:#d4d4d4;font-size:14px">O e-mail da sua conta no LockPro foi alterado para <b>${newEmail}</b>. Se não foi você, redefina sua senha imediatamente.</p>
+      </div>
+    `;
+
+    await this.send(to, subject, text, html, newEmail);
+  }
+
   private async sendViaBrevoHttp(
     to: string,
     subject: string,

@@ -20,6 +20,7 @@ export interface SocialLinksView {
 
 export interface PublicProfileView {
   id: string;
+  userId: string;
   username: string | null;
   handle: string | null;
   avatarUrl: string | null;
@@ -30,6 +31,7 @@ export interface PublicProfileView {
   bannerNsfw: boolean;
   profileColor: string | null;
   socialLinks: SocialLinksView | null;
+  friendsPublic: boolean;
   createdAt: Date;
 }
 
@@ -62,10 +64,12 @@ function parseSocialLinks(raw: Prisma.JsonValue | null | undefined): SocialLinks
 
 export interface CommunityProfileView {
   id: string;
+  userId: string;
   username: string | null;
   handle: string | null;
   avatarUrl: string | null;
   favoriteHeroId: number | null;
+  mutualFriendsCount: number;
 }
 
 @Injectable()
@@ -138,6 +142,7 @@ export class ProfilesService {
             bannerNsfw: true,
             profileColor: true,
             socialLinks: true,
+            friendsPublic: true,
             updatedAt: true,
           },
         },
@@ -274,10 +279,49 @@ export class ProfilesService {
     const safeLimit = Math.min(100, Math.max(1, Math.trunc(limit) || 8));
     const q = search?.trim().replace(/^@+/, '');
 
-    return this.prisma.profile.findMany({
+    const myFriendIds = new Set<string>();
+    const mutualCounts = new Map<string, number>();
+
+    if (excludeUserId) {
+      const myFriendships = await this.prisma.friendship.findMany({
+        where: {
+          status: 'ACCEPTED',
+          OR: [{ requesterId: excludeUserId }, { addresseeId: excludeUserId }],
+        },
+        select: { requesterId: true, addresseeId: true },
+      });
+
+      for (const f of myFriendships) {
+        myFriendIds.add(f.requesterId === excludeUserId ? f.addresseeId : f.requesterId);
+      }
+
+      if (myFriendIds.size > 0) {
+        const myFriendArr = Array.from(myFriendIds);
+        const secondDegree = await this.prisma.friendship.findMany({
+          where: {
+            status: 'ACCEPTED',
+            OR: [{ requesterId: { in: myFriendArr } }, { addresseeId: { in: myFriendArr } }],
+          },
+          select: { requesterId: true, addresseeId: true },
+        });
+
+        for (const f of secondDegree) {
+          if (myFriendIds.has(f.requesterId) && f.addresseeId !== excludeUserId && !myFriendIds.has(f.addresseeId)) {
+            mutualCounts.set(f.addresseeId, (mutualCounts.get(f.addresseeId) ?? 0) + 1);
+          }
+          if (myFriendIds.has(f.addresseeId) && f.requesterId !== excludeUserId && !myFriendIds.has(f.requesterId)) {
+            mutualCounts.set(f.requesterId, (mutualCounts.get(f.requesterId) ?? 0) + 1);
+          }
+        }
+      }
+    }
+
+    const excludedIds = excludeUserId ? [excludeUserId, ...Array.from(myFriendIds)] : [];
+
+    const candidates = await this.prisma.profile.findMany({
       where: {
         handle: { not: null },
-        ...(excludeUserId ? { userId: { not: excludeUserId } } : {}),
+        ...(excludedIds.length > 0 ? { userId: { notIn: excludedIds } } : {}),
         ...(q
           ? {
               OR: [
@@ -289,14 +333,26 @@ export class ProfilesService {
       },
       select: {
         id: true,
+        userId: true,
         username: true,
         handle: true,
         avatarUrl: true,
         favoriteHeroId: true,
       },
       orderBy: q ? { username: 'asc' } : { updatedAt: 'desc' },
-      take: safeLimit,
+      take: q ? safeLimit : Math.max(safeLimit * 3, 50),
     });
+
+    const mapped: CommunityProfileView[] = candidates.map((c) => ({
+      ...c,
+      mutualFriendsCount: mutualCounts.get(c.userId) ?? 0,
+    }));
+
+    if (!q) {
+      mapped.sort((a, b) => b.mutualFriendsCount - a.mutualFriendsCount);
+    }
+
+    return mapped.slice(0, safeLimit);
   }
 
   async getByHandle(handle: string): Promise<PublicProfileView> {
@@ -309,6 +365,7 @@ export class ProfilesService {
       where: { handle: clean },
       select: {
         id: true,
+        userId: true,
         username: true,
         handle: true,
         avatarUrl: true,
@@ -319,6 +376,7 @@ export class ProfilesService {
         bannerNsfw: true,
         profileColor: true,
         socialLinks: true,
+        friendsPublic: true,
         createdAt: true,
       },
     });
