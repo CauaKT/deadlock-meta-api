@@ -229,8 +229,37 @@ export class ProfilesService {
     }
   }
 
+  private steamIdVariants(raw: string): string[] {
+    const clean = raw.trim();
+    if (!/^\d{3,20}$/.test(clean)) return clean ? [clean] : [];
+    const STEAM64_BASE = BigInt('76561197960265728');
+    const set = new Set<string>([clean]);
+    try {
+      const val = BigInt(clean);
+      if (val > STEAM64_BASE) set.add((val - STEAM64_BASE).toString());
+      else if (val > BigInt(0)) set.add((val + STEAM64_BASE).toString());
+    } catch {}
+    return Array.from(set);
+  }
+
   async updateSettings(userId: string, dto: UpdateProfileSettingsDto) {
     await this.ensureUniqueFields(userId, dto.username, null);
+
+    const cleanSteamId = dto.steamId?.trim() || null;
+    if (cleanSteamId) {
+      const variants = this.steamIdVariants(cleanSteamId);
+      const conflict = await this.prisma.profile.findFirst({
+        where: {
+          userId: { not: userId },
+          steamId: { in: variants },
+        },
+        select: { id: true },
+      });
+      if (conflict) {
+        throw new ConflictException('Este Steam ID já está vinculado a outra conta.');
+      }
+    }
+
     await this.moderation.assertSafeContent({
       texts: [
         dto.username,
@@ -384,6 +413,55 @@ export class ProfilesService {
     if (!profile) {
       throw new NotFoundException('Perfil não encontrado.');
     }
+
+    return {
+      ...profile,
+      socialLinks: parseSocialLinks(profile.socialLinks),
+    };
+  }
+
+  async getBySteamId(rawSteamId: string): Promise<PublicProfileView | null> {
+    const clean = rawSteamId.trim();
+    if (!/^\d{3,20}$/.test(clean)) return null;
+
+    const STEAM64_BASE = BigInt('76561197960265728');
+    const candidates = new Set<string>([clean]);
+    try {
+      const val = BigInt(clean);
+      if (val > STEAM64_BASE) {
+        candidates.add((val - STEAM64_BASE).toString());
+      } else if (val > BigInt(0)) {
+        candidates.add((val + STEAM64_BASE).toString());
+      }
+    } catch {
+      return null;
+    }
+
+    const profile = await this.prisma.profile.findFirst({
+      where: {
+        steamId: { in: Array.from(candidates) },
+        handle: { not: null },
+      },
+      orderBy: { updatedAt: 'desc' },
+      select: {
+        id: true,
+        userId: true,
+        username: true,
+        handle: true,
+        avatarUrl: true,
+        favoriteHeroId: true,
+        bio: true,
+        bannerHeroId: true,
+        bannerImage: true,
+        bannerNsfw: true,
+        profileColor: true,
+        socialLinks: true,
+        friendsPublic: true,
+        createdAt: true,
+      },
+    });
+
+    if (!profile) return null;
 
     return {
       ...profile,

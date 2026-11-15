@@ -75,4 +75,10 @@ export class ProfilesController {
   async byHandle(@Param('handle') handle: string) {
     return this.profilesService.getByHandle(handle);
   }
+
+  @UseGuards(OptionalJwtAuthGuard)
+  @Get('by-steam/:steamId')
+  async bySteam(@Param('steamId') steamId: string) {
+    return this.profilesService.getBySteamId(steamId);
+  }
 }

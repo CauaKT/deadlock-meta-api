@@ -179,7 +179,12 @@ export class AuthService {
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
         throw new ConflictException('E-mail ou nick já está em uso.');
       }
-      throw err;
+      this.logger.error(
+        `Falha ao criar usuário (${dto.email}): ${err instanceof Error ? err.stack ?? err.message : String(err)}`,
+      );
+      throw new ServiceUnavailableException(
+        'Não foi possível concluir o cadastro no momento. Tente novamente em instantes.',
+      );
     }
 
     try {

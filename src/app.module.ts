@@ -6,6 +6,7 @@ import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { AdminModule } from './admin/admin.module';
 import { AuthModule } from './auth/auth.module';
+import { BuildsModule } from './builds/builds.module';
 import { FeedModule } from './feed/feed.module';
 import { FriendsModule } from './friends/friends.module';
 import { MailModule } from './mail/mail.module';
