@@ -253,3 +253,12 @@ model TournamentPick {
   @@unique([matchId, userId])
   @@map("tournament_picks")
 }
+
+model LeaderboardSnapshot {
+  accountId BigInt   @id @map("account_id")
+  points    Int
+  updatedAt DateTime @map("updated_at")
+
+  @@index([points(sort: Desc), accountId])
+  @@map("leaderboard_snapshot")
+}

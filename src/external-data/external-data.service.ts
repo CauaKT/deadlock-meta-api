@@ -307,6 +307,45 @@ export class ExternalDataService {
     }
   }
 
+  private async loadSnapshotPage(
+    requestedPage: number,
+    limit: number,
+  ): Promise<{
+    total: number;
+    page: number;
+    rows: Array<{ rank: number; accountId: number; points: number }>;
+  } | null> {
+    try {
+      const countRows = await this.prisma.$queryRaw<Array<{ total: bigint }>>`
+        SELECT COUNT(*)::bigint AS total FROM leaderboard_snapshot`;
+      const total = Number(countRows[0]?.total ?? 0);
+      if (total === 0) return null;
+
+      const totalPages = Math.max(1, Math.ceil(total / limit));
+      const page = Math.min(requestedPage, totalPages);
+      const offset = (page - 1) * limit;
+      const rows = await this.prisma.$queryRaw<Array<{ account_id: bigint; points: number }>>`
+        SELECT account_id, points FROM leaderboard_snapshot
+        ORDER BY points DESC, account_id ASC
+        LIMIT ${limit} OFFSET ${offset}`;
+
+      return {
+        total,
+        page,
+        rows: rows.map((r, idx) => ({
+          rank: offset + idx + 1,
+          accountId: Number(r.account_id),
+          points: Number(r.points),
+        })),
+      };
+    } catch (err) {
+      this.logger.warn(
+        `Snapshot do leaderboard indisponível: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return null;
+    }
+  }
+
   async getLeaderboard(
     rawRegion: string,
     heroId?: number,
@@ -316,7 +355,7 @@ export class ExternalDataService {
     const region = ALLOWED_REGIONS.has(rawRegion) ? rawRegion : 'SAmerica';
     const validHeroId = heroId && Number.isInteger(heroId) && heroId > 0 ? heroId : null;
     const limit = Number.isFinite(rawLimit) ? Math.max(10, Math.min(50, Math.floor(rawLimit))) : 25;
-    const requestedPage = Number.isFinite(rawPage) ? Math.max(1, Math.min(200, Math.floor(rawPage))) : 1;
+    const requestedPage = Number.isFinite(rawPage) ? Math.max(1, Math.min(20000, Math.floor(rawPage))) : 1;
 
     const rawCacheKey = validHeroId
       ? `leaderboard_raw:v5:${region}:hero:${validHeroId}`
@@ -392,7 +431,14 @@ export class ExternalDataService {
       return map;
     };
 
-    const { data: rawEntries } = await this.withDbCache<ResolvedRawEntry[]>(
+    const snapshot =
+      region === 'Global' && !validHeroId
+        ? await this.loadSnapshotPage(requestedPage, limit)
+        : null;
+
+    const { data: rawEntries } = snapshot
+      ? { data: [] as ResolvedRawEntry[] }
+      : await this.withDbCache<ResolvedRawEntry[]>(
       rawCacheKey,
       'deadlock-api',
       1800,
@@ -515,13 +561,24 @@ export class ExternalDataService {
       true,
     );
 
-    const totalEntries = rawEntries.length;
+    const totalEntries = snapshot ? snapshot.total : rawEntries.length;
     const totalPages = Math.max(1, Math.ceil(totalEntries / limit));
-    const page = Math.min(requestedPage, totalPages);
+    const page = snapshot ? snapshot.page : Math.min(requestedPage, totalPages);
     const startIdx = (page - 1) * limit;
-    const pageSlice = rawEntries.slice(startIdx, startIdx + limit);
+    const pageSlice: ResolvedRawEntry[] = snapshot
+      ? snapshot.rows.map((row) => ({
+          rank: row.rank,
+          accountId: row.accountId,
+          accountName: `Jogador #${row.rank}`,
+          badgeLevel: null,
+          rankedRank: null,
+          rankedSubrank: null,
+          points: row.points,
+          topHeroIds: [],
+        }))
+      : rawEntries.slice(startIdx, startIdx + limit);
 
-    const pageCacheKey = `leaderboard_page:v18:${region}:h${validHeroId ?? 0}:p${page}:l${limit}`;
+    const pageCacheKey = `leaderboard_page:v19:${snapshot ? 'snap' : 'raw'}:${region}:h${validHeroId ?? 0}:p${page}:l${limit}`;
 
     const [{ data: pageEntries, fetchedAt }, activeMap] = await Promise.all([
       this.withDbCache<NormalizedLeaderboardEntry[]>(
@@ -550,6 +607,18 @@ export class ExternalDataService {
           );
 
           if (allIds.length > 0) {
+            if (snapshot) {
+              const rankMap = await fetchRanksBatch(allIds);
+              for (const entry of entries) {
+                const row = entry.accountId ? rankMap.get(entry.accountId) : undefined;
+                if (!row) continue;
+                entry.badgeLevel = typeof row.badge === 'number' && row.badge > 0 ? row.badge : null;
+                entry.rankedRank = typeof row.rank === 'number' && row.rank > 0 ? row.rank : null;
+                entry.rankedSubrank =
+                  typeof row.subrank === 'number' && row.subrank > 0 ? row.subrank : null;
+              }
+            }
+
             const [statsRes, steamRes] = await Promise.allSettled([
               this.fetchJson<Array<Record<string, unknown>>>(
                 `${DEADLOCK_API_BASE}/v1/players/hero-stats?account_ids=${allIds.join(',')}`,
@@ -599,6 +668,7 @@ export class ExternalDataService {
 
             if (steamRes.status === 'fulfilled' && Array.isArray(steamRes.value)) {
               const avatarById = new Map<number, string>();
+              const nameById = new Map<number, string>();
               for (const row of steamRes.value) {
                 const aid = Number(row.account_id ?? 0);
                 const av =
@@ -608,10 +678,16 @@ export class ExternalDataService {
                       ? row.avatar
                       : null;
                 if (aid > 0 && av) avatarById.set(aid, av);
+                if (aid > 0 && typeof row.personaname === 'string' && row.personaname.trim()) {
+                  nameById.set(aid, row.personaname.trim());
+                }
               }
               for (const entry of entries) {
                 if (entry.accountId !== null) {
                   entry.avatarUrl = avatarById.get(entry.accountId) ?? null;
+                  if (snapshot) {
+                    entry.accountName = nameById.get(entry.accountId) ?? entry.accountName;
+                  }
                 }
               }
             }
