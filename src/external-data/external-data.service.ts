@@ -28,6 +28,7 @@ const ALLOWED_REGIONS = new Set<string>(['Global', ...REGIONAL_LIST]);
 @Injectable()
 export class ExternalDataService {
   private readonly logger = new Logger(ExternalDataService.name);
+  private readonly refreshingKeys = new Set<string>();
 
   constructor(private readonly prisma: PrismaService) {}
 
@@ -44,14 +45,21 @@ export class ExternalDataService {
   }
 
   private async fetchJson<T>(url: string): Promise<T> {
-    const res = await fetch(url, {
-      headers: { Accept: 'application/json' },
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status} em ${url}`);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const res = await fetch(url, {
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (res.status === 429 && attempt < 2) {
+        await new Promise((resolve) => setTimeout(resolve, 600 * (attempt + 1)));
+        continue;
+      }
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} em ${url}`);
+      }
+      return (await res.json()) as T;
     }
-    return (await res.json()) as T;
+    throw new Error(`HTTP 429 em ${url}`);
   }
 
   private async withDbCache<T>(
@@ -59,6 +67,7 @@ export class ExternalDataService {
     source: string,
     ttlSeconds: number,
     producer: () => Promise<T>,
+    staleWhileRevalidate = false,
   ): Promise<{ data: T; fetchedAt: string }> {
     const now = new Date();
     const cached = await this.prisma.externalCache.findUnique({
@@ -72,7 +81,7 @@ export class ExternalDataService {
       };
     }
 
-    try {
+    const refresh = async () => {
       const fresh = await producer();
       const fetchedAt = new Date();
       const expiresAt = new Date(fetchedAt.getTime() + ttlSeconds * 1000);
@@ -95,6 +104,29 @@ export class ExternalDataService {
       });
 
       return { data: fresh, fetchedAt: fetchedAt.toISOString() };
+    };
+
+    if (cached && staleWhileRevalidate) {
+      if (!this.refreshingKeys.has(key)) {
+        this.refreshingKeys.add(key);
+        void refresh()
+          .catch((err) => {
+            this.logger.warn(
+              `Falha ao revalidar cache em segundo plano (${key}): ${err instanceof Error ? err.message : String(err)}`,
+            );
+          })
+          .finally(() => {
+            this.refreshingKeys.delete(key);
+          });
+      }
+      return {
+        data: cached.payload as T,
+        fetchedAt: cached.fetchedAt.toISOString(),
+      };
+    }
+
+    try {
+      return await refresh();
     } catch (err) {
       this.logger.warn(
         `Falha ao consultar fonte externa (${key}): ${err instanceof Error ? err.message : String(err)}`,
@@ -120,7 +152,7 @@ export class ExternalDataService {
       'deadlock-api',
       900,
       async () => {
-        const [heroRes, historyRes, mmrRes, steamRes] = await Promise.allSettled([
+        const [heroRes, historyRes, mmrRes, rankRes, steamRes] = await Promise.allSettled([
           this.fetchJson<Array<Record<string, unknown>>>(
             `${DEADLOCK_API_BASE}/v1/players/${accountId}/hero-stats`,
           ),
@@ -130,6 +162,9 @@ export class ExternalDataService {
           this.fetchJson<Array<Record<string, unknown>>>(
             `${DEADLOCK_API_BASE}/v1/players/${accountId}/mmr`,
           ),
+          this.fetchJson<{ badge?: number | null; rank?: number | null; subrank?: number | null }>(
+            `${DEADLOCK_API_BASE}/v1/players/${accountId}/rank`,
+          ),
           this.fetchJson<Array<Record<string, unknown>>>(
             `${DEADLOCK_API_BASE}/v1/players/steam?account_ids=${accountId}`,
           ),
@@ -138,6 +173,7 @@ export class ExternalDataService {
         const rawHeroes = heroRes.status === 'fulfilled' && Array.isArray(heroRes.value) ? heroRes.value : [];
         const rawHistory = historyRes.status === 'fulfilled' && Array.isArray(historyRes.value) ? historyRes.value : [];
         const rawMmr = mmrRes.status === 'fulfilled' && Array.isArray(mmrRes.value) ? mmrRes.value : [];
+        const rawRank = rankRes.status === 'fulfilled' ? rankRes.value : null;
         const rawSteam = steamRes.status === 'fulfilled' && Array.isArray(steamRes.value) ? steamRes.value[0] : null;
 
         const topHeroes: NormalizedPlayerHeroStat[] = rawHeroes
@@ -201,9 +237,13 @@ export class ExternalDataService {
 
         const latestMmr = rawMmr[0];
         const rankBadge =
-          typeof latestMmr?.division === 'number' && typeof latestMmr?.division_tier === 'number'
-            ? latestMmr.division * 10 + latestMmr.division_tier
-            : null;
+          typeof rawRank?.badge === 'number' && rawRank.badge > 0
+            ? rawRank.badge
+            : typeof rawRank?.rank === 'number' && rawRank.rank > 0
+              ? rawRank.rank * 10 + (typeof rawRank.subrank === 'number' && rawRank.subrank > 0 ? rawRank.subrank : 1)
+              : typeof latestMmr?.division === 'number' && typeof latestMmr?.division_tier === 'number'
+                ? latestMmr.division * 10 + latestMmr.division_tier
+                : null;
 
         return {
           accountId,
@@ -271,38 +311,94 @@ export class ExternalDataService {
     rawRegion: string,
     heroId?: number,
     rawPage = 1,
-    rawLimit = 50,
+    rawLimit = 25,
   ): Promise<NormalizedLeaderboardResponse> {
     const region = ALLOWED_REGIONS.has(rawRegion) ? rawRegion : 'SAmerica';
     const validHeroId = heroId && Number.isInteger(heroId) && heroId > 0 ? heroId : null;
-    const limit = Number.isFinite(rawLimit) ? Math.max(10, Math.min(50, Math.floor(rawLimit))) : 50;
-    const requestedPage = Number.isFinite(rawPage) ? Math.max(1, Math.min(20, Math.floor(rawPage))) : 1;
+    const limit = Number.isFinite(rawLimit) ? Math.max(10, Math.min(50, Math.floor(rawLimit))) : 25;
+    const requestedPage = Number.isFinite(rawPage) ? Math.max(1, Math.min(200, Math.floor(rawPage))) : 1;
 
     const rawCacheKey = validHeroId
-      ? `leaderboard_raw:v2:${region}:hero:${validHeroId}`
-      : `leaderboard_raw:v2:${region}`;
+      ? `leaderboard_raw:v5:${region}:hero:${validHeroId}`
+      : `leaderboard_raw:v5:${region}`;
 
-    const fetchRankForId = async (accountId: number) => {
-      const res = await fetch(`${DEADLOCK_API_BASE}/v1/players/${accountId}/rank`, {
-        headers: { Accept: 'application/json' },
-        signal: AbortSignal.timeout(4500),
-      });
-      if (!res.ok) return null;
-      return (await res.json()) as {
-        badge?: number | null;
-        rank?: number | null;
-        subrank?: number | null;
-        last_match?: {
-          player_rank_final_flat_progress?: number | null;
-        } | null;
-      };
+    type BatchRankRow = {
+      account_id?: number;
+      badge?: number | null;
+      rank?: number | null;
+      subrank?: number | null;
+      last_match?: {
+        player_rank_final_flat_progress?: number | null;
+      } | null;
     };
 
-    const { data: rawEntries } = await this.withDbCache<Array<Record<string, unknown>>>(
+    type ResolvedRawEntry = {
+      rank: number;
+      accountId: number | null;
+      accountName: string;
+      badgeLevel: number | null;
+      rankedRank: number | null;
+      rankedSubrank: number | null;
+      points: number | null;
+      topHeroIds: number[];
+    };
+
+    const tierOfValues = (badgeLevel: number | null, rankedRank: number | null) => {
+      if (typeof rankedRank === 'number' && rankedRank >= 1) return rankedRank;
+      if (typeof badgeLevel === 'number' && badgeLevel >= 11) return Math.floor(badgeLevel / 10);
+      return 0;
+    };
+
+    const fetchRanksBatch = async (ids: number[]): Promise<Map<number, BatchRankRow>> => {
+      const unique = Array.from(new Set(ids.filter((id) => Number.isFinite(id) && id > 0)));
+      const map = new Map<number, BatchRankRow>();
+      const chunks: number[][] = [];
+      for (let i = 0; i < unique.length; i += 100) {
+        chunks.push(unique.slice(i, i + 100));
+      }
+
+      for (let w = 0; w < chunks.length; w += 3) {
+        if (w > 0) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        const wave = chunks.slice(w, w + 3);
+        await Promise.allSettled(
+          wave.map(async (chunk) => {
+            const url = `${DEADLOCK_API_BASE}/v1/players/rank?account_ids=${chunk.join(',')}`;
+            let res = await fetch(url, {
+              headers: { Accept: 'application/json' },
+              signal: AbortSignal.timeout(8000),
+            }).catch(() => null);
+            if (res && res.status === 429) {
+              await new Promise((resolve) => setTimeout(resolve, 600));
+              res = await fetch(url, {
+                headers: { Accept: 'application/json' },
+                signal: AbortSignal.timeout(8000),
+              }).catch(() => null);
+            }
+            if (res && res.ok) {
+              const rows = (await res.json()) as BatchRankRow[];
+              if (Array.isArray(rows)) {
+                for (const row of rows) {
+                  if (typeof row.account_id === 'number' && row.account_id > 0) {
+                    map.set(row.account_id, row);
+                  }
+                }
+              }
+            }
+          }),
+        );
+      }
+      return map;
+    };
+
+    const { data: rawEntries } = await this.withDbCache<ResolvedRawEntry[]>(
       rawCacheKey,
       'deadlock-api',
       1800,
       async () => {
+        let baseList: Array<Record<string, unknown>> = [];
+
         if (region === 'Global') {
           const regionalResults = await Promise.allSettled(
             REGIONAL_LIST.map((reg) => {
@@ -317,11 +413,10 @@ export class ExternalDataService {
               (r): r is PromiseFulfilledResult<{ entries?: Array<Record<string, unknown>> }> =>
                 r.status === 'fulfilled' && Array.isArray(r.value?.entries),
             )
-            .map((r) => r.value.entries!.slice(0, 120));
+            .map((r) => r.value.entries!.slice(0, 220));
 
-          const merged: Array<Record<string, unknown>> = [];
           const seenNames = new Set<string>();
-          for (let i = 0; i < 120; i += 1) {
+          for (let i = 0; i < 220; i += 1) {
             for (const bucket of buckets) {
               const item = bucket[i];
               if (!item) continue;
@@ -329,19 +424,95 @@ export class ExternalDataService {
                 typeof item.account_name === 'string' ? item.account_name.trim().toLowerCase() : '';
               if (nameKey && seenNames.has(nameKey)) continue;
               if (nameKey) seenNames.add(nameKey);
-              merged.push(item);
+              baseList.push(item);
             }
           }
-          return merged.slice(0, 500);
+        } else {
+          const endpoint = validHeroId
+            ? `${DEADLOCK_API_BASE}/v1/leaderboard/${region}/${validHeroId}`
+            : `${DEADLOCK_API_BASE}/v1/leaderboard/${region}`;
+          const raw = await this.fetchJson<{ entries?: Array<Record<string, unknown>> }>(endpoint);
+          const list = Array.isArray(raw?.entries) ? raw.entries : [];
+          baseList = list.slice(0, 1000);
         }
 
-        const endpoint = validHeroId
-          ? `${DEADLOCK_API_BASE}/v1/leaderboard/${region}/${validHeroId}`
-          : `${DEADLOCK_API_BASE}/v1/leaderboard/${region}`;
-        const raw = await this.fetchJson<{ entries?: Array<Record<string, unknown>> }>(endpoint);
-        const list = Array.isArray(raw?.entries) ? raw.entries : [];
-        return list.slice(0, 1000);
+        const allCandidateIds: number[] = [];
+        const candidatesPerEntry = baseList.map((item) => {
+          const ids = Array.isArray(item.possible_account_ids)
+            ? item.possible_account_ids
+                .map((id) => Number(id))
+                .filter((id) => Number.isFinite(id) && id > 0)
+                .slice(0, 20)
+            : typeof item.account_id === 'number' && item.account_id > 0
+              ? [item.account_id]
+              : [];
+          for (const id of ids) allCandidateIds.push(id);
+          return ids;
+        });
+
+        const rankMap = await fetchRanksBatch(allCandidateIds);
+
+        const resolved: ResolvedRawEntry[] = baseList.map((item, idx) => {
+          const candidates = candidatesPerEntry[idx] ?? [];
+          let bestId: number | null = candidates.length === 1 ? candidates[0] : null;
+          let bestRow: BatchRankRow | null = bestId ? (rankMap.get(bestId) ?? null) : null;
+          let bestTier = bestRow
+            ? tierOfValues(bestRow.badge ?? null, bestRow.rank ?? null)
+            : -1;
+          let bestPts =
+            typeof bestRow?.last_match?.player_rank_final_flat_progress === 'number'
+              ? bestRow.last_match.player_rank_final_flat_progress
+              : -1;
+
+          for (const cid of candidates) {
+            const row = rankMap.get(cid);
+            if (!row) continue;
+            const tier = tierOfValues(row.badge ?? null, row.rank ?? null);
+            const pts =
+              typeof row.last_match?.player_rank_final_flat_progress === 'number'
+                ? row.last_match.player_rank_final_flat_progress
+                : -1;
+            if (tier > bestTier || (tier === bestTier && pts > bestPts)) {
+              bestId = cid;
+              bestRow = row;
+              bestTier = tier;
+              bestPts = pts;
+            }
+          }
+
+          if (!bestId && candidates.length > 0) {
+            bestId = candidates[0];
+          }
+
+          return {
+            rank: Number(item.rank ?? idx + 1),
+            accountId: bestId,
+            accountName:
+              typeof item.account_name === 'string' && item.account_name.trim()
+                ? item.account_name.trim()
+                : `Jogador #${idx + 1}`,
+            badgeLevel: typeof bestRow?.badge === 'number' && bestRow.badge > 0 ? bestRow.badge : null,
+            rankedRank: typeof bestRow?.rank === 'number' && bestRow.rank > 0 ? bestRow.rank : null,
+            rankedSubrank:
+              typeof bestRow?.subrank === 'number' && bestRow.subrank > 0 ? bestRow.subrank : null,
+            points: bestPts >= 0 ? bestPts : null,
+            topHeroIds: Array.isArray(item.top_hero_ids)
+              ? item.top_hero_ids.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0)
+              : [],
+          };
+        });
+
+        resolved.sort((a, b) => {
+          const tierDiff =
+            tierOfValues(b.badgeLevel, b.rankedRank) - tierOfValues(a.badgeLevel, a.rankedRank);
+          if (tierDiff !== 0) return tierDiff;
+          const ptsDiff = (b.points ?? -1) - (a.points ?? -1);
+          return ptsDiff !== 0 ? ptsDiff : a.rank - b.rank;
+        });
+
+        return resolved.slice(0, 1000);
       },
+      true,
     );
 
     const totalEntries = rawEntries.length;
@@ -350,13 +521,7 @@ export class ExternalDataService {
     const startIdx = (page - 1) * limit;
     const pageSlice = rawEntries.slice(startIdx, startIdx + limit);
 
-    const pageCacheKey = `leaderboard_page:v13:${region}:h${validHeroId ?? 0}:p${page}:l${limit}`;
-
-    const tierOf = (e: NormalizedLeaderboardEntry) => {
-      if (typeof e.rankedRank === 'number' && e.rankedRank >= 1) return e.rankedRank;
-      if (typeof e.badgeLevel === 'number' && e.badgeLevel >= 11) return Math.floor(e.badgeLevel / 10);
-      return 0;
-    };
+    const pageCacheKey = `leaderboard_page:v18:${region}:h${validHeroId ?? 0}:p${page}:l${limit}`;
 
     const [{ data: pageEntries, fetchedAt }, activeMap] = await Promise.all([
       this.withDbCache<NormalizedLeaderboardEntry[]>(
@@ -364,214 +529,97 @@ export class ExternalDataService {
         'deadlock-api',
         1800,
         async () => {
-          const candidatesByIndex: number[][] = [];
-          const entries: NormalizedLeaderboardEntry[] = pageSlice.map((item, idx) => {
-            const candidates = Array.isArray(item.possible_account_ids)
-              ? item.possible_account_ids
-                  .map((id) => Number(id))
-                  .filter((id) => Number.isFinite(id) && id > 0)
-                  .slice(0, 4)
-              : typeof item.account_id === 'number' && item.account_id > 0
-                ? [item.account_id]
-                : [];
-            candidatesByIndex.push(candidates);
-
-            return {
-              rank: Number(item.rank ?? startIdx + idx + 1),
-              accountId: null,
-              accountName:
-                typeof item.account_name === 'string' && item.account_name.trim()
-                  ? item.account_name.trim()
-                  : `Jogador #${startIdx + idx + 1}`,
-              avatarUrl: null,
-              badgeLevel: typeof item.badge_level === 'number' ? item.badge_level : null,
-              rankedRank: typeof item.ranked_rank === 'number' ? item.ranked_rank : null,
-              rankedSubrank: typeof item.ranked_subrank === 'number' ? item.ranked_subrank : null,
-              points: null,
-              matches: null,
-              wins: null,
-              losses: null,
-              winRate: null,
-              topHeroIds: Array.isArray(item.top_hero_ids)
-                ? item.top_hero_ids.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0)
-                : [],
-            };
-          });
-
-          const targets = entries
-            .map((entry, idx) => ({ entry, candidates: candidatesByIndex[idx] ?? [] }))
-            .filter((t) => t.candidates.length > 0);
-
-          for (let i = 0; i < targets.length; i += 5) {
-            if (i > 0) {
-              await new Promise((resolve) => setTimeout(resolve, 180));
-            }
-            const chunk = targets.slice(i, i + 5);
-            await Promise.allSettled(
-              chunk.map(async ({ entry, candidates }) => {
-                let chosenId: number | null = null;
-                let chosenRank: Awaited<ReturnType<typeof fetchRankForId>> = null;
-                let chosenPoints = -1;
-
-                if (candidates.length === 1) {
-                  chosenId = candidates[0];
-                  chosenRank = await fetchRankForId(chosenId).catch(() => null);
-                  chosenPoints =
-                    typeof chosenRank?.last_match?.player_rank_final_flat_progress === 'number'
-                      ? chosenRank.last_match.player_rank_final_flat_progress
-                      : -1;
-                } else {
-                  const firstId = candidates[0];
-                  const firstRk = await fetchRankForId(firstId).catch(() => null);
-                  const firstPts =
-                    typeof firstRk?.last_match?.player_rank_final_flat_progress === 'number'
-                      ? firstRk.last_match.player_rank_final_flat_progress
-                      : -1;
-                  const firstTier = typeof firstRk?.rank === 'number' ? firstRk.rank : 0;
-
-                  if (firstTier >= 10 || firstPts >= 55000) {
-                    chosenId = firstId;
-                    chosenRank = firstRk;
-                    chosenPoints = firstPts;
-                  } else {
-                    const others = await Promise.allSettled(
-                      candidates.slice(1).map(async (cid) => ({
-                        cid,
-                        rk: await fetchRankForId(cid),
-                      })),
-                    );
-                    let bestId = firstId;
-                    let bestRk = firstRk;
-                    let bestPts = firstPts;
-                    let bestTier = firstTier;
-
-                    for (const o of others) {
-                      if (o.status !== 'fulfilled' || !o.value.rk) continue;
-                      const pts =
-                        typeof o.value.rk.last_match?.player_rank_final_flat_progress === 'number'
-                          ? o.value.rk.last_match.player_rank_final_flat_progress
-                          : -1;
-                      const tier = typeof o.value.rk.rank === 'number' ? o.value.rk.rank : 0;
-                      if (pts > bestPts || (pts === bestPts && tier > bestTier)) {
-                        bestId = o.value.cid;
-                        bestRk = o.value.rk;
-                        bestPts = pts;
-                        bestTier = tier;
-                      }
-                    }
-
-                    const minTier = startIdx < 50 ? 10 : 7;
-                    const minPts = startIdx < 50 ? 55000 : 38000;
-                    if (bestTier >= minTier || bestPts >= minPts) {
-                      chosenId = bestId;
-                      chosenRank = bestRk;
-                      chosenPoints = bestPts;
-                    }
-                  }
-                }
-
-                if (!chosenId) return;
-
-                entry.accountId = chosenId;
-                if (chosenRank) {
-                  if (typeof chosenRank.badge === 'number') entry.badgeLevel = chosenRank.badge;
-                  if (typeof chosenRank.rank === 'number') entry.rankedRank = chosenRank.rank;
-                  if (typeof chosenRank.subrank === 'number') entry.rankedSubrank = chosenRank.subrank;
-                  if (chosenPoints >= 0) entry.points = chosenPoints;
-                }
-
-                let statsRes = await fetch(
-                  `${DEADLOCK_API_BASE}/v1/players/${chosenId}/hero-stats`,
-                  { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(4500) },
-                ).catch(() => null);
-                if (statsRes && statsRes.status === 429) {
-                  await new Promise((resolve) => setTimeout(resolve, 500));
-                  statsRes = await fetch(
-                    `${DEADLOCK_API_BASE}/v1/players/${chosenId}/hero-stats`,
-                    { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(4500) },
-                  ).catch(() => null);
-                }
-
-                if (statsRes && statsRes.ok) {
-                  const heroRows = (await statsRes.json()) as Array<Record<string, unknown>>;
-                  if (Array.isArray(heroRows)) {
-                    let totalMatches = 0;
-                    let totalWins = 0;
-                    const playedHeroes: Array<{ heroId: number; matches: number }> = [];
-
-                    for (const h of heroRows) {
-                      const hid = Number(h.hero_id ?? 0);
-                      const m = Number(h.matches_played ?? h.matches ?? 0);
-                      const w = Number(h.wins ?? 0);
-                      if (m > 0) {
-                        totalMatches += m;
-                        totalWins += w;
-                        if (hid > 0) playedHeroes.push({ heroId: hid, matches: m });
-                      }
-                    }
-                    if (totalMatches > 0) {
-                      entry.matches = totalMatches;
-                      entry.wins = totalWins;
-                      entry.losses = Math.max(0, totalMatches - totalWins);
-                      entry.winRate = Number(((totalWins / totalMatches) * 100).toFixed(1));
-                    }
-
-                    if (entry.topHeroIds.length < 3 && playedHeroes.length > 0) {
-                      playedHeroes.sort((a, b) => b.matches - a.matches);
-                      for (const ph of playedHeroes) {
-                        if (!entry.topHeroIds.includes(ph.heroId)) {
-                          entry.topHeroIds.push(ph.heroId);
-                        }
-                        if (entry.topHeroIds.length >= 3) break;
-                      }
-                    }
-                  }
-                }
-              }),
-            );
-          }
+          const entries: NormalizedLeaderboardEntry[] = pageSlice.map((item) => ({
+            rank: item.rank,
+            accountId: item.accountId,
+            accountName: item.accountName,
+            avatarUrl: null,
+            badgeLevel: item.badgeLevel,
+            rankedRank: item.rankedRank,
+            rankedSubrank: item.rankedSubrank,
+            points: item.points,
+            matches: null,
+            wins: null,
+            losses: null,
+            winRate: null,
+            topHeroIds: [...item.topHeroIds],
+          }));
 
           const allIds = Array.from(
             new Set(entries.map((e) => e.accountId).filter((id): id is number => id !== null && id > 0)),
           );
+
           if (allIds.length > 0) {
-            try {
-              await new Promise((resolve) => setTimeout(resolve, 250));
-              const steamRows = await this.fetchJson<Array<Record<string, unknown>>>(
+            const [statsRes, steamRes] = await Promise.allSettled([
+              this.fetchJson<Array<Record<string, unknown>>>(
+                `${DEADLOCK_API_BASE}/v1/players/hero-stats?account_ids=${allIds.join(',')}`,
+              ),
+              this.fetchJson<Array<Record<string, unknown>>>(
                 `${DEADLOCK_API_BASE}/v1/players/steam?account_ids=${allIds.join(',')}`,
-              );
-              if (Array.isArray(steamRows)) {
-                const avatarById = new Map<number, string>();
-                for (const row of steamRows) {
-                  const aid = Number(row.account_id ?? 0);
-                  const av =
-                    typeof row.avatarmedium === 'string'
-                      ? row.avatarmedium
-                      : typeof row.avatar === 'string'
-                        ? row.avatar
-                        : null;
-                  if (aid > 0 && av) avatarById.set(aid, av);
-                }
-                for (const entry of entries) {
-                  if (entry.accountId !== null) {
-                    entry.avatarUrl = avatarById.get(entry.accountId) ?? null;
+              ),
+            ]);
+
+            if (statsRes.status === 'fulfilled' && Array.isArray(statsRes.value)) {
+              const byAccount = new Map<
+                number,
+                { matches: number; wins: number; heroes: Array<{ heroId: number; matches: number }> }
+              >();
+              for (const h of statsRes.value) {
+                const aid = Number(h.account_id ?? 0);
+                const hid = Number(h.hero_id ?? 0);
+                const m = Number(h.matches_played ?? h.matches ?? 0);
+                const w = Number(h.wins ?? 0);
+                if (aid <= 0 || m <= 0) continue;
+                const bucket = byAccount.get(aid) ?? { matches: 0, wins: 0, heroes: [] };
+                bucket.matches += m;
+                bucket.wins += w;
+                if (hid > 0) bucket.heroes.push({ heroId: hid, matches: m });
+                byAccount.set(aid, bucket);
+              }
+
+              for (const entry of entries) {
+                if (!entry.accountId) continue;
+                const agg = byAccount.get(entry.accountId);
+                if (!agg || agg.matches <= 0) continue;
+                entry.matches = agg.matches;
+                entry.wins = agg.wins;
+                entry.losses = Math.max(0, agg.matches - agg.wins);
+                entry.winRate = Number(((agg.wins / agg.matches) * 100).toFixed(1));
+                if (entry.topHeroIds.length < 3 && agg.heroes.length > 0) {
+                  agg.heroes.sort((a, b) => b.matches - a.matches);
+                  for (const ph of agg.heroes) {
+                    if (!entry.topHeroIds.includes(ph.heroId)) {
+                      entry.topHeroIds.push(ph.heroId);
+                    }
+                    if (entry.topHeroIds.length >= 3) break;
                   }
                 }
               }
-            } catch {
-              // Ignora falha pontual de avatar Steam
+            }
+
+            if (steamRes.status === 'fulfilled' && Array.isArray(steamRes.value)) {
+              const avatarById = new Map<number, string>();
+              for (const row of steamRes.value) {
+                const aid = Number(row.account_id ?? 0);
+                const av =
+                  typeof row.avatarmedium === 'string'
+                    ? row.avatarmedium
+                    : typeof row.avatar === 'string'
+                      ? row.avatar
+                      : null;
+                if (aid > 0 && av) avatarById.set(aid, av);
+              }
+              for (const entry of entries) {
+                if (entry.accountId !== null) {
+                  entry.avatarUrl = avatarById.get(entry.accountId) ?? null;
+                }
+              }
             }
           }
 
-          entries.sort((a, b) => {
-            const tierDiff = tierOf(b) - tierOf(a);
-            if (tierDiff !== 0) return tierDiff;
-            const ptsDiff = (b.points ?? -1) - (a.points ?? -1);
-            return ptsDiff !== 0 ? ptsDiff : a.rank - b.rank;
-          });
-
           return entries;
         },
+        true,
       ),
       this.getActiveMatchesMap(),
     ]);
