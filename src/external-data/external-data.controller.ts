@@ -10,6 +10,11 @@ export class ExternalDataController {
     return this.externalDataService.getStatus();
   }
 
+  @Get('rank-distribution')
+  getRankDistribution() {
+    return this.externalDataService.getRankDistribution();
+  }
+
   @Get('player/:accountId/summary')
   getPlayerSummary(@Param('accountId') accountId: string) {
     return this.externalDataService.getPlayerSummary(accountId);
@@ -19,9 +24,18 @@ export class ExternalDataController {
   getLeaderboard(
     @Param('region') region: string,
     @Query('heroId') heroId?: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
   ) {
     const parsedHeroId = heroId ? Number(heroId) : undefined;
-    return this.externalDataService.getLeaderboard(region, parsedHeroId);
+    const parsedPage = page ? Number(page) : undefined;
+    const parsedLimit = limit ? Number(limit) : undefined;
+    return this.externalDataService.getLeaderboard(
+      region,
+      parsedHeroId,
+      parsedPage,
+      parsedLimit,
+    );
   }
 
   @Get('matches/:matchId')

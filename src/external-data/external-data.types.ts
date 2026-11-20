@@ -45,15 +45,38 @@ export interface NormalizedLeaderboardEntry {
   rank: number;
   accountId: number | null;
   accountName: string;
+  avatarUrl: string | null;
   badgeLevel: number | null;
   rankedRank: number | null;
   rankedSubrank: number | null;
+  points: number | null;
+  matches: number | null;
+  wins: number | null;
+  losses: number | null;
+  winRate: number | null;
+  liveMatchId?: number | null;
+  liveHeroId?: number | null;
+  liveMinutes?: number | null;
   topHeroIds: number[];
+}
+
+export interface RankDistributionTier {
+  tier: number;
+  uniquePlayers: number;
+}
+
+export interface RankDistributionResponse {
+  totalPlayers: number;
+  tiers: RankDistributionTier[];
+  fetchedAt: string;
 }
 
 export interface NormalizedLeaderboardResponse {
   region: string;
   heroId: number | null;
+  page: number;
+  totalPages: number;
+  totalEntries: number;
   entries: NormalizedLeaderboardEntry[];
   fetchedAt: string;
 }
