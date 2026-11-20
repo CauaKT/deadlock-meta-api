@@ -310,30 +310,55 @@ export class ExternalDataService {
   private async loadSnapshotPage(
     requestedPage: number,
     limit: number,
+    tier: number | null,
+    region: string,
   ): Promise<{
     total: number;
     page: number;
     rows: Array<{ rank: number; accountId: number; points: number }>;
   } | null> {
     try {
-      const countRows = await this.prisma.$queryRaw<Array<{ total: bigint }>>`
-        SELECT COUNT(*)::bigint AS total FROM leaderboard_snapshot`;
+      const lo = tier ? 6500 * (tier - 1) : -1000000;
+      const hi = tier && tier < 11 ? 6500 * tier : 1000000000;
+      const isGlobal = region === 'Global';
+      const countRows = isGlobal
+        ? await this.prisma.$queryRaw<Array<{ all_rows: bigint; total: bigint; above: bigint }>>`
+            SELECT COUNT(*)::bigint AS all_rows,
+              COUNT(*) FILTER (WHERE points >= ${lo} AND points < ${hi})::bigint AS total,
+              COUNT(*) FILTER (WHERE points >= ${hi})::bigint AS above
+            FROM leaderboard_snapshot`
+        : await this.prisma.$queryRaw<Array<{ all_rows: bigint; total: bigint; above: bigint }>>`
+            SELECT COUNT(*)::bigint AS all_rows,
+              COUNT(*) FILTER (WHERE points >= ${lo} AND points < ${hi})::bigint AS total,
+              COUNT(*) FILTER (WHERE points >= ${hi})::bigint AS above
+            FROM leaderboard_snapshot
+            WHERE region = ${region}`;
+
+      const allRows = Number(countRows[0]?.all_rows ?? 0);
       const total = Number(countRows[0]?.total ?? 0);
-      if (total === 0) return null;
+      const above = tier ? Number(countRows[0]?.above ?? 0) : 0;
+      if (allRows === 0) return null;
 
       const totalPages = Math.max(1, Math.ceil(total / limit));
       const page = Math.min(requestedPage, totalPages);
       const offset = (page - 1) * limit;
-      const rows = await this.prisma.$queryRaw<Array<{ account_id: bigint; points: number }>>`
-        SELECT account_id, points FROM leaderboard_snapshot
-        ORDER BY points DESC, account_id ASC
-        LIMIT ${limit} OFFSET ${offset}`;
+      const rows = isGlobal
+        ? await this.prisma.$queryRaw<Array<{ account_id: bigint; points: number }>>`
+            SELECT account_id, points FROM leaderboard_snapshot
+            WHERE points >= ${lo} AND points < ${hi}
+            ORDER BY points DESC, account_id ASC
+            LIMIT ${limit} OFFSET ${offset}`
+        : await this.prisma.$queryRaw<Array<{ account_id: bigint; points: number }>>`
+            SELECT account_id, points FROM leaderboard_snapshot
+            WHERE region = ${region} AND points >= ${lo} AND points < ${hi}
+            ORDER BY points DESC, account_id ASC
+            LIMIT ${limit} OFFSET ${offset}`;
 
       return {
         total,
         page,
         rows: rows.map((r, idx) => ({
-          rank: offset + idx + 1,
+          rank: above + offset + idx + 1,
           accountId: Number(r.account_id),
           points: Number(r.points),
         })),
@@ -348,18 +373,34 @@ export class ExternalDataService {
 
   async getLeaderboard(
     rawRegion: string,
-    heroId?: number,
+    heroIds?: number[] | number,
     rawPage = 1,
     rawLimit = 25,
+    rawTier?: number,
   ): Promise<NormalizedLeaderboardResponse> {
     const region = ALLOWED_REGIONS.has(rawRegion) ? rawRegion : 'SAmerica';
-    const validHeroId = heroId && Number.isInteger(heroId) && heroId > 0 ? heroId : null;
+    const rawHeroList = Array.isArray(heroIds)
+      ? heroIds
+      : typeof heroIds === 'number'
+        ? [heroIds]
+        : [];
+    const validHeroIds = Array.from(
+      new Set(rawHeroList.filter((id) => Number.isInteger(id) && id > 0)),
+    ).slice(0, 3);
+    const validHeroId = validHeroIds[0] ?? null;
+    const heroKey =
+      validHeroIds.length > 0 ? [...validHeroIds].sort((a, b) => a - b).join(',') : '0';
     const limit = Number.isFinite(rawLimit) ? Math.max(10, Math.min(50, Math.floor(rawLimit))) : 25;
     const requestedPage = Number.isFinite(rawPage) ? Math.max(1, Math.min(20000, Math.floor(rawPage))) : 1;
+    const validTier =
+      typeof rawTier === 'number' && Number.isInteger(rawTier) && rawTier >= 1 && rawTier <= 11
+        ? rawTier
+        : null;
 
-    const rawCacheKey = validHeroId
-      ? `leaderboard_raw:v5:${region}:hero:${validHeroId}`
-      : `leaderboard_raw:v5:${region}`;
+    const rawCacheKey =
+      validHeroIds.length > 0
+        ? `leaderboard_raw:v6:${region}:heroes:${heroKey}`
+        : `leaderboard_raw:v5:${region}`;
 
     type BatchRankRow = {
       account_id?: number;
@@ -432,27 +473,171 @@ export class ExternalDataService {
     };
 
     const snapshot =
-      region === 'Global' && !validHeroId
-        ? await this.loadSnapshotPage(requestedPage, limit)
+      validHeroIds.length === 0
+        ? await this.loadSnapshotPage(requestedPage, limit, validTier, region)
         : null;
 
     const { data: rawEntries } = snapshot
       ? { data: [] as ResolvedRawEntry[] }
       : await this.withDbCache<ResolvedRawEntry[]>(
-      rawCacheKey,
+      validHeroIds.length > 0
+        ? `leaderboard_raw:v9:${region}:t${validTier ?? 0}:heroes:${heroKey}`
+        : rawCacheKey,
       'deadlock-api',
       1800,
       async () => {
+        if (validHeroIds.length > 0) {
+          const lo = validTier ? 6500 * (validTier - 1) : -1000000;
+          const hi = validTier && validTier < 11 ? 6500 * validTier : 1000000000;
+          const isGlobal = region === 'Global';
+
+          let candidates: Array<{ account_id: bigint; points: number }> = [];
+          try {
+            const tierHaving = validTier
+              ? ` AND pts >= ${lo} AND pts < ${hi}`
+              : '';
+            const sql =
+              'SELECT account_id, argMax(player_rank_final_flat_progress, start_time) AS pts ' +
+              'FROM match_player_latest ' +
+              `WHERE start_time > now() - INTERVAL 14 DAY AND rank_interval = 2 AND hero_id IN (${validHeroIds.join(',')}) ` +
+              'AND player_rank_final_flat_progress IS NOT NULL ' +
+              'GROUP BY account_id ' +
+              `HAVING COUNT(DISTINCT hero_id) = ${validHeroIds.length}${tierHaving} ` +
+              'ORDER BY pts DESC LIMIT 200';
+            const sqlRes = await fetch(
+              `${DEADLOCK_API_BASE}/v1/sql?format=json&query=${encodeURIComponent(sql)}`,
+              { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(25_000) },
+            );
+            if (!sqlRes.ok) {
+              this.logger.warn(`/v1/sql retornou HTTP ${sqlRes.status} para heroes=${heroKey}`);
+            } else {
+              const sqlRows = (await sqlRes.json()) as Array<{ account_id?: number; pts?: number }>;
+              if (Array.isArray(sqlRows) && sqlRows.length > 0) {
+                const sqlMapped = sqlRows
+                  .map((r) => ({
+                    account_id: BigInt(Math.floor(Number(r.account_id ?? 0))),
+                    points: Math.round(Number(r.pts ?? 0)),
+                  }))
+                  .filter((r) => r.account_id > 0n);
+
+                if (isGlobal) {
+                  candidates = sqlMapped;
+                } else if (sqlMapped.length > 0) {
+                  const sqlIds = sqlMapped.map((r) => r.account_id);
+                  const regRows = await this.prisma.$queryRaw<Array<{ account_id: bigint }>>`
+                    SELECT account_id FROM leaderboard_snapshot
+                    WHERE region = ${region} AND account_id = ANY(${sqlIds}::bigint[])`;
+                  const allowed = new Set(regRows.map((r) => r.account_id.toString()));
+                  candidates = sqlMapped.filter((r) => allowed.has(r.account_id.toString()));
+                }
+              }
+            }
+          } catch (err) {
+            this.logger.warn(
+              `Busca global por heróis via /v1/sql indisponível: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+
+          if (candidates.length === 0) {
+            candidates = isGlobal
+              ? await this.prisma.$queryRaw<Array<{ account_id: bigint; points: number }>>`
+                  SELECT account_id, points FROM leaderboard_snapshot
+                  WHERE points >= ${lo} AND points < ${hi}
+                  ORDER BY points DESC, account_id ASC
+                  LIMIT 600`
+              : await this.prisma.$queryRaw<Array<{ account_id: bigint; points: number }>>`
+                  SELECT account_id, points FROM leaderboard_snapshot
+                  WHERE region = ${region} AND points >= ${lo} AND points < ${hi}
+                  ORDER BY points DESC, account_id ASC
+                  LIMIT 600`;
+          }
+
+          if (candidates.length > 0) {
+            const aboveRow = validTier
+              ? isGlobal
+                ? await this.prisma.$queryRaw<Array<{ above: bigint }>>`
+                    SELECT COUNT(*)::bigint AS above FROM leaderboard_snapshot WHERE points >= ${hi}`
+                : await this.prisma.$queryRaw<Array<{ above: bigint }>>`
+                    SELECT COUNT(*)::bigint AS above FROM leaderboard_snapshot WHERE region = ${region} AND points >= ${hi}`
+              : [{ above: BigInt(0) }];
+            const above = Number(aboveRow[0]?.above ?? 0);
+
+            const ids = candidates.map((c) => Number(c.account_id)).filter((id) => id > 0);
+            const byAccount = new Map<number, Array<{ heroId: number; matches: number }>>();
+            for (let i = 0; i < ids.length; i += 100) {
+              if (i > 0) await new Promise((resolve) => setTimeout(resolve, 100));
+              const chunk = ids.slice(i, i + 100);
+              try {
+                const stats = await this.fetchJson<Array<Record<string, unknown>>>(
+                  `${DEADLOCK_API_BASE}/v1/players/hero-stats?account_ids=${chunk.join(',')}`,
+                );
+                if (Array.isArray(stats)) {
+                  for (const h of stats) {
+                    const aid = Number(h.account_id ?? 0);
+                    const hid = Number(h.hero_id ?? 0);
+                    const m = Number(h.matches_played ?? h.matches ?? 0);
+                    if (aid > 0 && hid > 0 && m > 0) {
+                      const arr = byAccount.get(aid) ?? [];
+                      arr.push({ heroId: hid, matches: m });
+                      byAccount.set(aid, arr);
+                    }
+                  }
+                }
+              } catch (err) {
+                this.logger.warn(
+                  `Falha em hero-stats top5 batch: ${err instanceof Error ? err.message : String(err)}`,
+                );
+              }
+            }
+
+            const matched: ResolvedRawEntry[] = [];
+            for (let idx = 0; idx < candidates.length; idx += 1) {
+              const aid = Number(candidates[idx].account_id);
+              const played = byAccount.get(aid);
+              if (!played || played.length === 0) continue;
+              played.sort((a, b) => b.matches - a.matches);
+              const top5 = played.slice(0, 5).map((x) => x.heroId);
+              if (!validHeroIds.every((hid) => top5.includes(hid))) continue;
+              matched.push({
+                rank: above + idx + 1,
+                accountId: aid,
+                accountName: `Jogador #${above + idx + 1}`,
+                badgeLevel: null,
+                rankedRank: null,
+                rankedSubrank: null,
+                points: Number(candidates[idx].points),
+                topHeroIds: top5.slice(0, 3),
+              });
+            }
+
+            if (matched.length > 0) {
+              const rankMap = await fetchRanksBatch(matched.map((m) => m.accountId!));
+              for (const entry of matched) {
+                const row = entry.accountId ? rankMap.get(entry.accountId) : undefined;
+                if (!row) continue;
+                entry.badgeLevel = typeof row.badge === 'number' && row.badge > 0 ? row.badge : null;
+                entry.rankedRank = typeof row.rank === 'number' && row.rank > 0 ? row.rank : null;
+                entry.rankedSubrank =
+                  typeof row.subrank === 'number' && row.subrank > 0 ? row.subrank : null;
+              }
+            }
+
+            return matched;
+          }
+        }
         let baseList: Array<Record<string, unknown>> = [];
 
         if (region === 'Global') {
+          const endpoints =
+            validHeroIds.length > 0
+              ? REGIONAL_LIST.flatMap((reg) =>
+                  validHeroIds.map((hid) => `${DEADLOCK_API_BASE}/v1/leaderboard/${reg}/${hid}`),
+                )
+              : REGIONAL_LIST.map((reg) => `${DEADLOCK_API_BASE}/v1/leaderboard/${reg}`);
           const regionalResults = await Promise.allSettled(
-            REGIONAL_LIST.map((reg) => {
-              const ep = validHeroId
-                ? `${DEADLOCK_API_BASE}/v1/leaderboard/${reg}/${validHeroId}`
-                : `${DEADLOCK_API_BASE}/v1/leaderboard/${reg}`;
-              return this.fetchJson<{ entries?: Array<Record<string, unknown>> }>(ep);
-            }),
+            endpoints.map((ep) =>
+              this.fetchJson<{ entries?: Array<Record<string, unknown>> }>(ep),
+            ),
           );
           const buckets = regionalResults
             .filter(
@@ -473,6 +658,34 @@ export class ExternalDataService {
               baseList.push(item);
             }
           }
+        } else if (validHeroIds.length > 1) {
+          const heroResults = await Promise.allSettled(
+            validHeroIds.map((hid) =>
+              this.fetchJson<{ entries?: Array<Record<string, unknown>> }>(
+                `${DEADLOCK_API_BASE}/v1/leaderboard/${region}/${hid}`,
+              ),
+            ),
+          );
+          const buckets = heroResults
+            .filter(
+              (r): r is PromiseFulfilledResult<{ entries?: Array<Record<string, unknown>> }> =>
+                r.status === 'fulfilled' && Array.isArray(r.value?.entries),
+            )
+            .map((r) => r.value.entries!.slice(0, 400));
+
+          const seenNames = new Set<string>();
+          for (let i = 0; i < 400; i += 1) {
+            for (const bucket of buckets) {
+              const item = bucket[i];
+              if (!item) continue;
+              const nameKey =
+                typeof item.account_name === 'string' ? item.account_name.trim().toLowerCase() : '';
+              if (nameKey && seenNames.has(nameKey)) continue;
+              if (nameKey) seenNames.add(nameKey);
+              baseList.push(item);
+            }
+          }
+          baseList = baseList.slice(0, 1000);
         } else {
           const endpoint = validHeroId
             ? `${DEADLOCK_API_BASE}/v1/leaderboard/${region}/${validHeroId}`
@@ -578,7 +791,7 @@ export class ExternalDataService {
         }))
       : rawEntries.slice(startIdx, startIdx + limit);
 
-    const pageCacheKey = `leaderboard_page:v19:${snapshot ? 'snap' : 'raw'}:${region}:h${validHeroId ?? 0}:p${page}:l${limit}`;
+   const pageCacheKey = `leaderboard_page:v27:${snapshot ? 'snap' : 'raw'}:${region}:h${heroKey}:t${validTier ?? 0}:p${page}:l${limit}`;
 
     const [{ data: pageEntries, fetchedAt }, activeMap] = await Promise.all([
       this.withDbCache<NormalizedLeaderboardEntry[]>(
@@ -627,6 +840,17 @@ export class ExternalDataService {
                 `${DEADLOCK_API_BASE}/v1/players/steam?account_ids=${allIds.join(',')}`,
               ),
             ]);
+
+            if (statsRes.status === 'rejected') {
+              this.logger.warn(
+                `Falha em hero-stats batch: ${statsRes.reason instanceof Error ? statsRes.reason.message : String(statsRes.reason)}`,
+              );
+            }
+            if (steamRes.status === 'rejected') {
+              this.logger.warn(
+                `Falha em steam batch: ${steamRes.reason instanceof Error ? steamRes.reason.message : String(steamRes.reason)}`,
+              );
+            }
 
             if (statsRes.status === 'fulfilled' && Array.isArray(statsRes.value)) {
               const byAccount = new Map<
@@ -685,7 +909,7 @@ export class ExternalDataService {
               for (const entry of entries) {
                 if (entry.accountId !== null) {
                   entry.avatarUrl = avatarById.get(entry.accountId) ?? null;
-                  if (snapshot) {
+                  if (snapshot || validHeroIds.length > 0) {
                     entry.accountName = nameById.get(entry.accountId) ?? entry.accountName;
                   }
                 }
@@ -724,7 +948,45 @@ export class ExternalDataService {
     };
   }
 
-  async getRankDistribution(): Promise<RankDistributionResponse> {
+  async getRankDistribution(rawRegion?: string): Promise<RankDistributionResponse> {
+    const region =
+      rawRegion && rawRegion !== 'Global' && ALLOWED_REGIONS.has(rawRegion)
+        ? rawRegion
+        : 'Global';
+
+    if (region !== 'Global') {
+      try {
+        const snapRows = await this.prisma.$queryRaw<Array<{ tier: number; cnt: bigint }>>`
+          SELECT
+            LEAST(11, GREATEST(1, CASE WHEN points >= 65000 THEN 11 ELSE (points / 6500)::int + 1 END))::int AS tier,
+            COUNT(*)::bigint AS cnt
+          FROM leaderboard_snapshot
+          WHERE region = ${region}
+          GROUP BY 1`;
+
+        if (snapRows.length > 0) {
+          const byTier = new Map<number, number>();
+          let totalPlayers = 0;
+          for (const r of snapRows) {
+            const count = Number(r.cnt ?? 0);
+            if (r.tier >= 1 && r.tier <= 11 && count > 0) {
+              byTier.set(r.tier, count);
+              totalPlayers += count;
+            }
+          }
+          const tiers: RankDistributionTier[] = [];
+          for (let t = 11; t >= 1; t -= 1) {
+            tiers.push({ tier: t, uniquePlayers: byTier.get(t) ?? 0 });
+          }
+          return { totalPlayers, tiers, fetchedAt: new Date().toISOString() };
+        }
+      } catch (err) {
+        this.logger.warn(
+          `Distribuição regional indisponível (${region}): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
     const { data, fetchedAt } = await this.withDbCache<{
       totalPlayers: number;
       tiers: RankDistributionTier[];

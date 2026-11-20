@@ -257,8 +257,12 @@ model TournamentPick {
 model LeaderboardSnapshot {
   accountId BigInt   @id @map("account_id")
   points    Int
+  region    String?
+  topHeroes Int[]    @default([]) @map("top_heroes")
   updatedAt DateTime @map("updated_at")
 
   @@index([points(sort: Desc), accountId])
+  @@index([region, points(sort: Desc), accountId])
+  @@index([topHeroes], type: Gin)
   @@map("leaderboard_snapshot")
 }

@@ -11,8 +11,8 @@ export class ExternalDataController {
   }
 
   @Get('rank-distribution')
-  getRankDistribution() {
-    return this.externalDataService.getRankDistribution();
+  getRankDistribution(@Query('region') region?: string) {
+    return this.externalDataService.getRankDistribution(region);
   }
 
   @Get('player/:accountId/summary')
@@ -24,17 +24,24 @@ export class ExternalDataController {
   getLeaderboard(
     @Param('region') region: string,
     @Query('heroId') heroId?: string,
+    @Query('heroIds') heroIds?: string,
     @Query('page') page?: string,
     @Query('limit') limit?: string,
+    @Query('tier') tier?: string,
   ) {
-    const parsedHeroId = heroId ? Number(heroId) : undefined;
+    const parsedHeroIds = (heroIds ? heroIds.split(',') : heroId ? [heroId] : [])
+      .map((v) => Number(v.trim()))
+      .filter((n) => Number.isInteger(n) && n > 0)
+      .slice(0, 3);
     const parsedPage = page ? Number(page) : undefined;
     const parsedLimit = limit ? Number(limit) : undefined;
+    const parsedTier = tier ? Number(tier) : undefined;
     return this.externalDataService.getLeaderboard(
       region,
-      parsedHeroId,
+      parsedHeroIds,
       parsedPage,
       parsedLimit,
+      parsedTier,
     );
   }
 
