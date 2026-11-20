@@ -29,6 +29,7 @@ model User {
   email         String      @unique
   passwordHash  String?     @map("password_hash")
   googleId      String?     @unique @map("google_id")
+  steamId       String?     @unique @map("steam_id")
   role               Role        @default(USER)
   emailVerified      Boolean     @default(false) @map("email_verified")
   mustChangePassword Boolean     @default(false) @map("must_change_password")
@@ -40,6 +41,8 @@ model User {
   posts               Post[]
   postComments        PostComment[]
   postLikes           PostLike[]
+  lfgPosts            LfgPost[]
+  tournamentPicks     TournamentPick[]
   sentFriendships     Friendship[] @relation("FriendshipRequester")
   receivedFriendships Friendship[] @relation("FriendshipAddressee")
   createdAt     DateTime    @default(now()) @map("created_at")
@@ -67,9 +70,10 @@ model Profile {
   id             String   @id @default(uuid())
   userId         String   @unique @map("user_id")
   user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  username       String?  @unique
-  handle         String?  @unique
-  bio            String?
+  username        String?  @unique
+  handle          String?  @unique
+  handleConfirmed Boolean  @default(false) @map("handle_confirmed")
+  bio             String?
   avatarUrl      String?  @map("avatar_url")
   steamId        String?  @map("steam_id")
   favoriteHeroId Int?     @map("favorite_hero_id")
@@ -167,4 +171,85 @@ model Friendship {
   @@unique([requesterId, addresseeId])
   @@index([addresseeId, status])
   @@map("friendships")
+}
+
+model ExternalCache {
+  key       String   @id
+  source    String
+  payload   Json
+  fetchedAt DateTime @default(now()) @map("fetched_at")
+  expiresAt DateTime @map("expires_at")
+
+  @@index([expiresAt])
+  @@map("external_cache")
+}
+
+model LfgPost {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  region    String
+  rankTier  String   @map("rank_tier")
+  mode      String
+  heroIds   Json     @map("hero_ids")
+  note      String
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([createdAt(sort: Desc)])
+  @@map("lfg_posts")
+}
+
+enum TournamentStatus {
+  ONGOING
+  UPCOMING
+  FINISHED
+}
+
+model Tournament {
+  id        String            @id @default(uuid())
+  title     String
+  region    String
+  prizePool String?           @map("prize_pool")
+  status    TournamentStatus  @default(UPCOMING)
+  relevance Int               @default(0)
+  startsAt  DateTime          @map("starts_at")
+  teams     Json
+  matches   TournamentMatch[]
+  createdAt DateTime          @default(now()) @map("created_at")
+  updatedAt DateTime          @updatedAt @map("updated_at")
+
+  @@index([status, relevance(sort: Desc)])
+  @@map("tournaments")
+}
+
+model TournamentMatch {
+  id           String           @id @default(uuid())
+  tournamentId String           @map("tournament_id")
+  tournament   Tournament       @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  round        Int
+  slot         Int
+  teamA        String           @map("team_a")
+  teamB        String           @map("team_b")
+  scoreA       Int              @default(0) @map("score_a")
+  scoreB       Int              @default(0) @map("score_b")
+  winner       String?
+  picks        TournamentPick[]
+
+  @@index([tournamentId, round, slot])
+  @@map("tournament_matches")
+}
+
+model TournamentPick {
+  id         String          @id @default(uuid())
+  matchId    String          @map("match_id")
+  match      TournamentMatch @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  userId     String          @map("user_id")
+  user       User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  pickedTeam String          @map("picked_team")
+  createdAt  DateTime        @default(now()) @map("created_at")
+  updatedAt  DateTime        @updatedAt @map("updated_at")
+
+  @@unique([matchId, userId])
+  @@map("tournament_picks")
 }

@@ -43,11 +43,13 @@ export interface SessionUserView {
   email: string;
   role: Role;
   emailVerified: boolean;
+  emailVerificationRequired: boolean;
   mustChangePassword: boolean;
   createdAt: Date;
   profile: {
     username: string | null;
     handle: string | null;
+    handleConfirmed: boolean;
     avatarUrl: string | null;
     favoriteHeroId: number | null;
   } | null;
@@ -67,6 +69,27 @@ export class AuthService {
 
   private requireEmailVerification(): boolean {
     return this.config.get<string>('REQUIRE_EMAIL_VERIFICATION') === 'true';
+  }
+
+  private withSessionView(
+    user: Omit<SessionUserView, 'emailVerificationRequired'>,
+  ): SessionUserView {
+    return {
+      ...user,
+      emailVerificationRequired: this.requireEmailVerification(),
+    };
+  }
+
+  private async generateProvisionalHandle(): Promise<string> {
+    for (let i = 0; i < 8; i++) {
+      const candidate = `user_${crypto.randomBytes(4).toString('hex')}`;
+      const exists = await this.prisma.profile.findUnique({
+        where: { handle: candidate },
+        select: { id: true },
+      });
+      if (!exists) return candidate;
+    }
+    return `user_${crypto.randomBytes(6).toString('hex')}`;
   }
 
   getFrontendUrl(): string {
@@ -144,8 +167,9 @@ export class AuthService {
 
     const passwordHash = await bcrypt.hash(dto.password, 12);
     const requireVerify = this.requireEmailVerification();
+    const provisionalHandle = await this.generateProvisionalHandle();
 
-    let createdUser: SessionUserView;
+    let createdUser: Omit<SessionUserView, 'emailVerificationRequired'>;
     try {
       createdUser = await this.prisma.user.create({
         data: {
@@ -155,6 +179,8 @@ export class AuthService {
           profile: {
             create: {
               username: dto.username,
+              handle: provisionalHandle,
+              handleConfirmed: false,
             },
           },
         },
@@ -169,6 +195,7 @@ export class AuthService {
             select: {
               username: true,
               handle: true,
+              handleConfirmed: true,
               avatarUrl: true,
               favoriteHeroId: true,
             },
@@ -215,7 +242,7 @@ export class AuthService {
     return {
       requiresEmailVerification: false,
       accessToken,
-      user: createdUser,
+      user: this.withSessionView(createdUser),
     };
   }
 
@@ -235,6 +262,7 @@ export class AuthService {
           select: {
             username: true,
             handle: true,
+            handleConfirmed: true,
             avatarUrl: true,
             favoriteHeroId: true,
           },
@@ -259,7 +287,7 @@ export class AuthService {
 
     const accessToken = await this.signSessionJwt(user.id, user.role, user.sessionVersion);
     const { passwordHash: _removed, sessionVersion: _sv, ...userView } = user;
-    return { accessToken, user: userView };
+    return { accessToken, user: this.withSessionView(userView) };
   }
 
   async getSessionUser(userId: string): Promise<SessionUserView> {
@@ -276,6 +304,7 @@ export class AuthService {
           select: {
             username: true,
             handle: true,
+            handleConfirmed: true,
             avatarUrl: true,
             favoriteHeroId: true,
           },
@@ -287,7 +316,7 @@ export class AuthService {
       throw new UnauthorizedException('Usuário não encontrado.');
     }
 
-    return user;
+    return this.withSessionView(user);
   }
 
   async changeOwnPassword(
@@ -334,6 +363,7 @@ export class AuthService {
             select: {
               username: true,
               handle: true,
+              handleConfirmed: true,
               avatarUrl: true,
               favoriteHeroId: true,
             },
@@ -351,7 +381,7 @@ export class AuthService {
       updated.sessionVersion,
     );
     const { sessionVersion: _sv, ...userView } = updated;
-    return { accessToken, user: userView };
+    return { accessToken, user: this.withSessionView(userView) };
   }
 
   async deleteOwnAccount(userId: string): Promise<void> {
@@ -602,6 +632,7 @@ export class AuthService {
               select: {
                 username: true,
                 handle: true,
+                handleConfirmed: true,
                 avatarUrl: true,
                 favoriteHeroId: true,
               },
@@ -628,7 +659,7 @@ export class AuthService {
 
     const { sessionVersion, ...userView } = updated;
     const accessToken = await this.signSessionJwt(updated.id, updated.role, sessionVersion);
-    return { accessToken, user: userView };
+    return { accessToken, user: this.withSessionView(userView) };
   }
 
   buildGoogleAuthorizeUrl(state: string): string | null {
@@ -715,6 +746,11 @@ export class AuthService {
       user = null;
     }
 
+    const needsProvisionalHandle = !user || !user.profile || !user.profile.handle;
+    const provisionalHandle = needsProvisionalHandle
+      ? await this.generateProvisionalHandle()
+      : undefined;
+
     if (user) {
       user = await this.prisma.user.update({
         where: { id: user.id },
@@ -722,10 +758,19 @@ export class AuthService {
           googleId: user.googleId ?? googleId,
           emailVerified: true,
           profile: user.profile
-            ? undefined
+            ? user.profile.handle
+              ? undefined
+              : {
+                  update: {
+                    handle: provisionalHandle,
+                    handleConfirmed: false,
+                  },
+                }
             : {
                 create: {
                   avatarUrl: info.picture ?? null,
+                  handle: provisionalHandle,
+                  handleConfirmed: false,
                 },
               },
         },
@@ -740,6 +785,8 @@ export class AuthService {
           profile: {
             create: {
               avatarUrl: info.picture ?? null,
+              handle: provisionalHandle,
+              handleConfirmed: false,
             },
           },
         },
@@ -756,7 +803,175 @@ export class AuthService {
       !user.profile ||
       !user.profile.username ||
       user.profile.username.trim() === '' ||
-      !user.profile.handle;
+      !user.profile.handle ||
+      !user.profile.handleConfirmed;
+
+    return { accessToken, needsOnboarding };
+  }
+
+  buildSteamAuthorizeUrl(): string {
+    const returnTo = `${this.getPublicApiUrl()}/auth/steam/callback`;
+    const realm = this.getFrontendUrl();
+    const params = new URLSearchParams({
+      'openid.ns': 'http://specs.openid.net/auth/2.0',
+      'openid.mode': 'checkid_setup',
+      'openid.return_to': returnTo,
+      'openid.realm': realm,
+      'openid.identity': 'http://specs.openid.net/auth/2.0/identifier_select',
+      'openid.claimed_id': 'http://specs.openid.net/auth/2.0/identifier_select',
+    });
+    return `https://steamcommunity.com/openid/login?${params.toString()}`;
+  }
+
+  async handleSteamCallback(
+    query: Record<string, string | undefined>,
+  ): Promise<{ accessToken: string; needsOnboarding: boolean }> {
+    if (query['openid.mode'] !== 'id_res') {
+      throw new UnauthorizedException('Autenticação Steam cancelada ou inválida.');
+    }
+
+    const claimedId = query['openid.claimed_id'] ?? '';
+    const match = claimedId.match(/^https?:\/\/steamcommunity\.com\/openid\/id\/(\d{17})$/);
+    if (!match) {
+      throw new UnauthorizedException('Steam ID inválido no retorno OpenID.');
+    }
+    const steamId = match[1];
+
+    const verifyParams = new URLSearchParams();
+    for (const [k, v] of Object.entries(query)) {
+      if (k.startsWith('openid.') && typeof v === 'string') {
+        verifyParams.set(k, v);
+      }
+    }
+    verifyParams.set('openid.mode', 'check_authentication');
+
+    const verifyRes = await fetch('https://steamcommunity.com/openid/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: verifyParams.toString(),
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (!verifyRes.ok) {
+      throw new UnauthorizedException('Falha ao validar assinatura com a Steam.');
+    }
+    const verifyText = await verifyRes.text();
+    if (!/is_valid\s*:\s*true/i.test(verifyText)) {
+      throw new UnauthorizedException('Assinatura OpenID da Steam recusada.');
+    }
+
+    // Busca nick e avatar públicos da Steam via Deadlock API para pré-preencher o onboarding
+    let steamPersona: string | null = null;
+    let steamAvatar: string | null = null;
+    try {
+      const accountId = (BigInt(steamId) - 76561197960265728n).toString();
+      const steamInfoRes = await fetch(
+        `https://api.deadlock-api.com/v1/players/steam?account_ids=${accountId}`,
+        { signal: AbortSignal.timeout(3000) },
+      );
+      if (steamInfoRes.ok) {
+        const list = (await steamInfoRes.json()) as Array<{
+          personaname?: string;
+          avatarfull?: string;
+          avatar?: string;
+        }>;
+        const first = Array.isArray(list) ? list[0] : null;
+        if (first?.avatarfull || first?.avatar) {
+          steamAvatar = first.avatarfull || first.avatar || null;
+        }
+        if (typeof first?.personaname === 'string') {
+          const cleaned = first.personaname
+            .replace(/[^a-zA-Z0-9_\-\s]/g, '')
+            .trim()
+            .slice(0, 20);
+          if (cleaned.length >= 3) {
+            const nickTaken = await this.prisma.profile.findFirst({
+              where: { username: { equals: cleaned, mode: 'insensitive' } },
+              select: { id: true },
+            });
+            if (!nickTaken) {
+              steamPersona = cleaned;
+            }
+          }
+        }
+      }
+    } catch {}
+
+    let user = await this.prisma.user.findUnique({
+      where: { steamId },
+      include: { profile: true },
+    });
+
+    const needsProvisionalHandle = !user || !user.profile || !user.profile.handle;
+    const provisionalHandle = needsProvisionalHandle
+      ? await this.generateProvisionalHandle()
+      : undefined;
+
+    if (user) {
+      if (!user.profile) {
+        user = await this.prisma.user.update({
+          where: { id: user.id },
+          data: {
+            profile: {
+              create: {
+                steamId,
+                username: steamPersona,
+                avatarUrl: steamAvatar,
+                handle: provisionalHandle,
+                handleConfirmed: false,
+              },
+            },
+          },
+          include: { profile: true },
+        });
+      } else if (!user.profile.steamId || (!user.profile.username && steamPersona) || (!user.profile.avatarUrl && steamAvatar)) {
+        user = await this.prisma.user.update({
+          where: { id: user.id },
+          data: {
+            profile: {
+              update: {
+                steamId: user.profile.steamId ?? steamId,
+                username: user.profile.username ?? steamPersona,
+                avatarUrl: user.profile.avatarUrl ?? steamAvatar,
+              },
+            },
+          },
+          include: { profile: true },
+        });
+      }
+    } else {
+      // Steam OpenID não fornece e-mail; usa identificador sintético não-roteável
+      const syntheticEmail = `steam_${steamId}@steam.lockpro.local`;
+      user = await this.prisma.user.create({
+        data: {
+          email: syntheticEmail,
+          steamId,
+          emailVerified: false,
+          profile: {
+            create: {
+              steamId,
+              username: steamPersona,
+              avatarUrl: steamAvatar,
+              handle: provisionalHandle,
+              handleConfirmed: false,
+            },
+          },
+        },
+        include: { profile: true },
+      });
+    }
+
+    const accessToken = await this.signSessionJwt(
+      user.id,
+      user.role,
+      user.sessionVersion,
+    );
+    const needsOnboarding =
+      !user.profile ||
+      !user.profile.username ||
+      user.profile.username.trim() === '' ||
+      !user.profile.handle ||
+      !user.profile.handleConfirmed;
 
     return { accessToken, needsOnboarding };
   }

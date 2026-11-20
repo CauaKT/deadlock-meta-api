@@ -170,11 +170,13 @@ export class ProfilesService {
           userId,
           username: dto.username,
           handle: dto.handle,
+          handleConfirmed: true,
           avatarUrl: dto.avatarUrl ?? null,
         },
         update: {
           username: dto.username,
           handle: dto.handle,
+          handleConfirmed: true,
           avatarUrl: dto.avatarUrl ?? null,
         },
       });

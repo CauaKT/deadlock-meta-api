@@ -413,4 +413,58 @@ export class AuthController {
       res.redirect(`${front}/login?error=auth-callback-failed`);
     }
   }
+
+  @Throttle({ default: { limit: 15, ttl: 60000 } })
+  @Get('steam')
+  steamAuth(@Query('next') next: string | undefined, @Res() res: Response): void {
+    const safeNext = next && next.startsWith('/') && !next.startsWith('//') ? next : '/';
+    res.cookie(
+      OAUTH_STATE_COOKIE_NAME,
+      JSON.stringify({ next: safeNext }),
+      {
+        ...this.clearCookieOptions(),
+        maxAge: 10 * 60 * 1000,
+      },
+    );
+    res.redirect(this.authService.buildSteamAuthorizeUrl());
+  }
+
+  @Throttle({ default: { limit: 15, ttl: 60000 } })
+  @Get('steam/callback')
+  async steamCallback(
+    @Query() query: Record<string, string | undefined>,
+    @Req() req: Request,
+    @Res() res: Response,
+  ): Promise<void> {
+    const front = this.authService.getFrontendUrl();
+    const cookies = req.cookies as Record<string, unknown> | undefined;
+    const rawCookie = cookies?.[OAUTH_STATE_COOKIE_NAME];
+    res.clearCookie(OAUTH_STATE_COOKIE_NAME, this.clearCookieOptions());
+
+    let safeNext = '/';
+    if (typeof rawCookie === 'string') {
+      try {
+        const parsed = JSON.parse(rawCookie) as { next?: string };
+        if (parsed.next && parsed.next.startsWith('/') && !parsed.next.startsWith('//')) {
+          safeNext = parsed.next;
+        }
+      } catch {}
+    }
+
+    try {
+      const { accessToken, needsOnboarding } = await this.authService.handleSteamCallback(query);
+      res.cookie(SESSION_COOKIE_NAME, accessToken, this.sessionCookieOptions());
+      const updated = await this.authService.mergeAccountToken(
+        this.readAccountTokens(req),
+        accessToken,
+      );
+      this.writeAccountsCookie(res, updated);
+      res.redirect(needsOnboarding ? `${front}/welcome` : `${front}${safeNext}`);
+    } catch (err) {
+      this.logger.warn(
+        `Steam callback exceção: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      res.redirect(`${front}/login?error=auth-callback-failed`);
+    }
+  }
 }

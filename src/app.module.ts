@@ -7,13 +7,17 @@ import { AppService } from './app.service';
 import { AdminModule } from './admin/admin.module';
 import { AuthModule } from './auth/auth.module';
 import { BuildsModule } from './builds/builds.module';
+import { ExternalDataModule } from './external-data/external-data.module';
 import { FeedModule } from './feed/feed.module';
 import { FriendsModule } from './friends/friends.module';
+import { LfgModule } from './lfg/lfg.module';
 import { MailModule } from './mail/mail.module';
+import { NotificationsModule } from './notifications/notifications.module';
 import { ModerationModule } from './moderation/moderation.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { ProfilesModule } from './profiles/profiles.module';
 import { TierListsModule } from './tier-lists/tier-lists.module';
+import { TournamentsModule } from './tournaments/tournaments.module';
 
 @Module({
   imports: [
@@ -34,6 +38,10 @@ import { TierListsModule } from './tier-lists/tier-lists.module';
     TierListsModule,
     FeedModule,
     FriendsModule,
+    ExternalDataModule,
+    NotificationsModule,
+    LfgModule,
+    TournamentsModule,
   ],
   controllers: [AppController],
   providers: [
