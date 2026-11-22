@@ -118,3 +118,16 @@ export interface ExternalDataStatus {
     ttlSeconds: number;
   }>;
 }
+
+export interface PlayerbaseDailyPoint {
+  date: string;
+  players: number;
+  matches: number;
+}
+
+export interface PlayerbaseOverviewResponse {
+  daily: PlayerbaseDailyPoint[];
+  rankedDistribution: RankDistributionResponse;
+  regions: Array<{ region: string; players: number }>;
+  fetchedAt: string;
+}

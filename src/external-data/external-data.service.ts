@@ -15,6 +15,7 @@ import type {
   NormalizedPlayerHeroStat,
   NormalizedPlayerMatch,
   NormalizedPlayerSummary,
+  PlayerbaseOverviewResponse,
   RankDistributionResponse,
   RankDistributionTier,
 } from './external-data.types';
@@ -44,11 +45,11 @@ export class ExternalDataService {
     return val.toString();
   }
 
-  private async fetchJson<T>(url: string): Promise<T> {
+  private async fetchJson<T>(url: string, timeoutMs = 10_000): Promise<T> {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const res = await fetch(url, {
         headers: { Accept: 'application/json' },
-        signal: AbortSignal.timeout(10_000),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       if (res.status === 429 && attempt < 2) {
         await new Promise((resolve) => setTimeout(resolve, 600 * (attempt + 1)));
@@ -312,47 +313,65 @@ export class ExternalDataService {
     limit: number,
     tier: number | null,
     region: string,
+    heroIds: number[] = [],
   ): Promise<{
     total: number;
     page: number;
-    rows: Array<{ rank: number; accountId: number; points: number }>;
+    rows: Array<{ rank: number; accountId: number; points: number; topHeroes: number[] }>;
   } | null> {
     try {
+      if (heroIds.length > 0) {
+        const synced = await this.prisma.$queryRaw<Array<{ ok: boolean }>>`
+          SELECT EXISTS (SELECT 1 FROM leaderboard_snapshot WHERE cardinality(top_heroes) > 0) AS ok`;
+        if (!synced[0]?.ok) return null;
+      } else {
+        const hasAny = await this.prisma.$queryRaw<Array<{ ok: boolean }>>`
+          SELECT EXISTS (SELECT 1 FROM leaderboard_snapshot) AS ok`;
+        if (!hasAny[0]?.ok) return null;
+      }
+
       const lo = tier ? 6500 * (tier - 1) : -1000000;
       const hi = tier && tier < 11 ? 6500 * tier : 1000000000;
-      const isGlobal = region === 'Global';
-      const countRows = isGlobal
-        ? await this.prisma.$queryRaw<Array<{ all_rows: bigint; total: bigint; above: bigint }>>`
-            SELECT COUNT(*)::bigint AS all_rows,
-              COUNT(*) FILTER (WHERE points >= ${lo} AND points < ${hi})::bigint AS total,
-              COUNT(*) FILTER (WHERE points >= ${hi})::bigint AS above
-            FROM leaderboard_snapshot`
-        : await this.prisma.$queryRaw<Array<{ all_rows: bigint; total: bigint; above: bigint }>>`
-            SELECT COUNT(*)::bigint AS all_rows,
-              COUNT(*) FILTER (WHERE points >= ${lo} AND points < ${hi})::bigint AS total,
-              COUNT(*) FILTER (WHERE points >= ${hi})::bigint AS above
-            FROM leaderboard_snapshot
-            WHERE region = ${region}`;
+      const regionSql =
+        region === 'Global' ? Prisma.empty : Prisma.sql`AND region = ${region}`;
+      const heroSql =
+        heroIds.length === 1
+          ? Prisma.sql`AND top_heroes[1] = ${heroIds[0]}`
+          : heroIds.length === 2
+            ? Prisma.sql`AND top_heroes[1:4] @> ${heroIds}::int[]`
+            : heroIds.length >= 3
+              ? Prisma.sql`AND top_heroes @> ${heroIds}::int[]`
+              : Prisma.empty;
 
-      const allRows = Number(countRows[0]?.all_rows ?? 0);
+      const countRows = await this.prisma.$queryRaw<Array<{ total: bigint }>>`
+        SELECT COUNT(*)::bigint AS total
+        FROM leaderboard_snapshot
+        WHERE points >= ${lo} AND points < ${hi} ${regionSql} ${heroSql}`;
       const total = Number(countRows[0]?.total ?? 0);
-      const above = tier ? Number(countRows[0]?.above ?? 0) : 0;
-      if (allRows === 0) return null;
+
+      const above = tier
+        ? Number(
+            (
+              await this.prisma.$queryRaw<Array<{ above: bigint }>>`
+                SELECT COUNT(*)::bigint AS above
+                FROM leaderboard_snapshot
+                WHERE points >= ${hi} ${regionSql} ${heroSql}`
+            )[0]?.above ?? 0,
+          )
+        : 0;
 
       const totalPages = Math.max(1, Math.ceil(total / limit));
       const page = Math.min(requestedPage, totalPages);
       const offset = (page - 1) * limit;
-      const rows = isGlobal
-        ? await this.prisma.$queryRaw<Array<{ account_id: bigint; points: number }>>`
-            SELECT account_id, points FROM leaderboard_snapshot
-            WHERE points >= ${lo} AND points < ${hi}
-            ORDER BY points DESC, account_id ASC
-            LIMIT ${limit} OFFSET ${offset}`
-        : await this.prisma.$queryRaw<Array<{ account_id: bigint; points: number }>>`
-            SELECT account_id, points FROM leaderboard_snapshot
-            WHERE region = ${region} AND points >= ${lo} AND points < ${hi}
-            ORDER BY points DESC, account_id ASC
-            LIMIT ${limit} OFFSET ${offset}`;
+
+      const rows = await this.prisma.$queryRaw<
+        Array<{ account_id: bigint; points: number; top_heroes: number[] }>
+      >`
+        SELECT account_id, points, top_heroes
+        FROM leaderboard_snapshot
+        WHERE points >= ${lo} AND points < ${hi} ${regionSql} ${heroSql}
+        ORDER BY points DESC, account_id ASC
+        LIMIT ${limit} OFFSET ${offset}`;
 
       return {
         total,
@@ -361,11 +380,187 @@ export class ExternalDataService {
           rank: above + offset + idx + 1,
           accountId: Number(r.account_id),
           points: Number(r.points),
+          topHeroes: Array.isArray(r.top_heroes) ? r.top_heroes : [],
         })),
       };
     } catch (err) {
       this.logger.warn(
         `Snapshot do leaderboard indisponível: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return null;
+    }
+  }
+
+  private async searchSnapshotByNick(
+    query: string,
+    requestedPage: number,
+    limit: number,
+    tier: number | null,
+    region: string,
+    heroIds: number[] = [],
+  ): Promise<{
+    total: number;
+    page: number;
+    rows: Array<{ rank: number; accountId: number; points: number; topHeroes: number[] }>;
+  } | null> {
+    try {
+      if (heroIds.length > 0) {
+        const synced = await this.prisma.$queryRaw<Array<{ ok: boolean }>>`
+          SELECT EXISTS (SELECT 1 FROM leaderboard_snapshot WHERE cardinality(top_heroes) > 0) AS ok`;
+        if (!synced[0]?.ok) return null;
+      } else {
+        const hasAny = await this.prisma.$queryRaw<Array<{ ok: boolean }>>`
+          SELECT EXISTS (SELECT 1 FROM leaderboard_snapshot) AS ok`;
+        if (!hasAny[0]?.ok) return null;
+      }
+
+      const STEAM64_BASE = 76561197960265728n;
+      const toAccountId = (raw?: string | null): number | null => {
+        if (!raw) return null;
+        const clean = raw.trim();
+        if (!/^\d+$/.test(clean)) return null;
+        if (clean.length === 17 && clean.startsWith('7656119')) {
+          const aid = Number(BigInt(clean) - STEAM64_BASE);
+          return Number.isInteger(aid) && aid > 0 ? aid : null;
+        }
+        if (clean.length >= 3 && clean.length <= 12) {
+          const aid = Number(clean);
+          return Number.isInteger(aid) && aid > 0 ? aid : null;
+        }
+        return null;
+      };
+
+      const resolveVanityAccountId = async (vanity: string): Promise<number | null> => {
+        try {
+          const res = await fetch(
+            `https://steamcommunity.com/id/${encodeURIComponent(vanity)}/?xml=1`,
+            { signal: AbortSignal.timeout(4000) },
+          );
+          if (!res.ok) return null;
+          const xml = await res.text();
+          const m = xml.match(/<steamID64>(\d{17})<\/steamID64>/);
+          return m ? toAccountId(m[1]) : null;
+        } catch {
+          return null;
+        }
+      };
+
+      const directIds: number[] = [];
+      let steamRows: Array<{ account_id?: number }> = [];
+
+      const q = query.trim();
+      const profileMatch = q.match(/steamcommunity\.com\/profiles\/(\d{17})/i);
+      const idUrlMatch = q.match(/steamcommunity\.com\/id\/([a-zA-Z0-9_-]+)/i);
+      const shortSteamMatch = q.match(/s\.team\/p\/[a-z0-9-]+/i);
+
+      if (q.startsWith('@')) {
+        const handleClean = q.slice(1).trim();
+        if (handleClean.length >= 2) {
+          const prof = await this.prisma.profile.findFirst({
+            where: { handle: { equals: handleClean, mode: 'insensitive' } },
+            select: { steamId: true, user: { select: { steamId: true } } },
+          });
+          const aid = toAccountId(prof?.steamId ?? prof?.user?.steamId ?? null);
+          if (aid) directIds.push(aid);
+        }
+      } else if (profileMatch) {
+        const aid = toAccountId(profileMatch[1]);
+        if (aid) directIds.push(aid);
+      } else if (idUrlMatch) {
+        const aid = await resolveVanityAccountId(idUrlMatch[1]);
+        if (aid) directIds.push(aid);
+      } else if (shortSteamMatch) {
+        try {
+          const fullUrl = q.startsWith('http') ? q : `https://${q}`;
+          const res = await fetch(fullUrl, { redirect: 'follow', signal: AbortSignal.timeout(4000) });
+          const m = res.url.match(/\/profiles\/(\d{17})/);
+          const v = res.url.match(/\/id\/([a-zA-Z0-9_-]+)/);
+          const aid = m ? toAccountId(m[1]) : v ? await resolveVanityAccountId(v[1]) : null;
+          if (aid) directIds.push(aid);
+        } catch {
+          // Ignora falha na resolução de link curto
+        }
+      } else {
+        const numId = toAccountId(q);
+        if (numId) {
+          directIds.push(numId);
+        } else {
+          const [searchRes, vanityRes] = await Promise.allSettled([
+            this.fetchJson<Array<{ account_id?: number }>>(
+              `${DEADLOCK_API_BASE}/v1/players/steam-search?search_query=${encodeURIComponent(q)}&limit=50`,
+              10_000,
+            ),
+            /^[a-zA-Z0-9_-]{2,64}$/.test(q) ? resolveVanityAccountId(q) : Promise.resolve(null),
+          ]);
+          if (searchRes.status === 'fulfilled' && Array.isArray(searchRes.value)) {
+            steamRows = searchRes.value;
+          }
+          if (vanityRes.status === 'fulfilled' && vanityRes.value) {
+            directIds.push(vanityRes.value);
+          }
+        }
+      }
+
+      const candidateIds = Array.from(
+        new Set([
+          ...directIds,
+          ...steamRows
+            .map((r) => Number(r.account_id ?? 0))
+            .filter((id) => Number.isInteger(id) && id > 0),
+        ]),
+      );
+      if (candidateIds.length === 0) {
+        return { total: 0, page: 1, rows: [] };
+      }
+
+      const lo = tier ? 6500 * (tier - 1) : -1000000;
+      const hi = tier && tier < 11 ? 6500 * tier : 1000000000;
+      const regionSql =
+        region === 'Global' ? Prisma.empty : Prisma.sql`AND region = ${region}`;
+      const heroSql =
+        heroIds.length === 1
+          ? Prisma.sql`AND top_heroes[1] = ${heroIds[0]}`
+          : heroIds.length === 2
+            ? Prisma.sql`AND top_heroes[1:4] @> ${heroIds}::int[]`
+            : heroIds.length >= 3
+              ? Prisma.sql`AND top_heroes @> ${heroIds}::int[]`
+              : Prisma.empty;
+
+      const matched = await this.prisma.$queryRaw<
+        Array<{ account_id: bigint; points: number; top_heroes: number[] }>
+      >`
+        SELECT account_id, points, top_heroes
+        FROM leaderboard_snapshot
+        WHERE account_id = ANY(${candidateIds.map((id) => BigInt(id))}::bigint[])
+          AND points >= ${lo} AND points < ${hi} ${regionSql} ${heroSql}
+        ORDER BY points DESC, account_id ASC`;
+
+      const total = matched.length;
+      const totalPages = Math.max(1, Math.ceil(total / limit));
+      const page = Math.min(requestedPage, totalPages);
+      const offset = (page - 1) * limit;
+      const slice = matched.slice(offset, offset + limit);
+
+      const ranked = await Promise.all(
+        slice.map(async (r) => {
+          const rkRows = await this.prisma.$queryRaw<Array<{ rk: bigint }>>`
+            SELECT COUNT(*)::bigint + 1 AS rk
+            FROM leaderboard_snapshot
+            WHERE (points > ${r.points} OR (points = ${r.points} AND account_id < ${r.account_id}))
+              ${regionSql} ${heroSql}`;
+          return {
+            rank: Number(rkRows[0]?.rk ?? 1),
+            accountId: Number(r.account_id),
+            points: Number(r.points),
+            topHeroes: Array.isArray(r.top_heroes) ? r.top_heroes : [],
+          };
+        }),
+      );
+
+      return { total, page, rows: ranked };
+    } catch (err) {
+      this.logger.warn(
+        `Busca global por nick indisponível: ${err instanceof Error ? err.message : String(err)}`,
       );
       return null;
     }
@@ -377,6 +572,7 @@ export class ExternalDataService {
     rawPage = 1,
     rawLimit = 25,
     rawTier?: number,
+    rawSearch?: string,
   ): Promise<NormalizedLeaderboardResponse> {
     const region = ALLOWED_REGIONS.has(rawRegion) ? rawRegion : 'SAmerica';
     const rawHeroList = Array.isArray(heroIds)
@@ -396,6 +592,7 @@ export class ExternalDataService {
       typeof rawTier === 'number' && Number.isInteger(rawTier) && rawTier >= 1 && rawTier <= 11
         ? rawTier
         : null;
+    const searchQuery = typeof rawSearch === 'string' ? rawSearch.trim().slice(0, 64) : '';
 
     const rawCacheKey =
       validHeroIds.length > 0
@@ -445,19 +642,8 @@ export class ExternalDataService {
         await Promise.allSettled(
           wave.map(async (chunk) => {
             const url = `${DEADLOCK_API_BASE}/v1/players/rank?account_ids=${chunk.join(',')}`;
-            let res = await fetch(url, {
-              headers: { Accept: 'application/json' },
-              signal: AbortSignal.timeout(8000),
-            }).catch(() => null);
-            if (res && res.status === 429) {
-              await new Promise((resolve) => setTimeout(resolve, 600));
-              res = await fetch(url, {
-                headers: { Accept: 'application/json' },
-                signal: AbortSignal.timeout(8000),
-              }).catch(() => null);
-            }
-            if (res && res.ok) {
-              const rows = (await res.json()) as BatchRankRow[];
+            try {
+              const rows = await this.fetchJson<BatchRankRow[]>(url, 15_000);
               if (Array.isArray(rows)) {
                 for (const row of rows) {
                   if (typeof row.account_id === 'number' && row.account_id > 0) {
@@ -465,6 +651,8 @@ export class ExternalDataService {
                   }
                 }
               }
+            } catch {
+              // Ignora falha pontual de lote de patente
             }
           }),
         );
@@ -473,15 +661,28 @@ export class ExternalDataService {
     };
 
     const snapshot =
-      validHeroIds.length === 0
-        ? await this.loadSnapshotPage(requestedPage, limit, validTier, region)
-        : null;
+      searchQuery.length >= 2
+        ? await this.searchSnapshotByNick(
+            searchQuery,
+            requestedPage,
+            limit,
+            validTier,
+            region,
+            validHeroIds,
+          )
+        : await this.loadSnapshotPage(
+            requestedPage,
+            limit,
+            validTier,
+            region,
+            validHeroIds,
+          );
 
     const { data: rawEntries } = snapshot
       ? { data: [] as ResolvedRawEntry[] }
       : await this.withDbCache<ResolvedRawEntry[]>(
       validHeroIds.length > 0
-        ? `leaderboard_raw:v9:${region}:t${validTier ?? 0}:heroes:${heroKey}`
+        ? `leaderboard_raw:v10:${region}:t${validTier ?? 0}:heroes:${heroKey}`
         : rawCacheKey,
       'deadlock-api',
       1800,
@@ -503,7 +704,7 @@ export class ExternalDataService {
               'AND player_rank_final_flat_progress IS NOT NULL ' +
               'GROUP BY account_id ' +
               `HAVING COUNT(DISTINCT hero_id) = ${validHeroIds.length}${tierHaving} ` +
-              'ORDER BY pts DESC LIMIT 200';
+              'ORDER BY pts DESC LIMIT 3000';
             const sqlRes = await fetch(
               `${DEADLOCK_API_BASE}/v1/sql?format=json&query=${encodeURIComponent(sql)}`,
               { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(25_000) },
@@ -544,13 +745,15 @@ export class ExternalDataService {
                   SELECT account_id, points FROM leaderboard_snapshot
                   WHERE points >= ${lo} AND points < ${hi}
                   ORDER BY points DESC, account_id ASC
-                  LIMIT 600`
+                  LIMIT 100`
               : await this.prisma.$queryRaw<Array<{ account_id: bigint; points: number }>>`
                   SELECT account_id, points FROM leaderboard_snapshot
                   WHERE region = ${region} AND points >= ${lo} AND points < ${hi}
                   ORDER BY points DESC, account_id ASC
-                  LIMIT 600`;
+                  LIMIT 100`;
           }
+
+          candidates = candidates.slice(0, 100);
 
           if (candidates.length > 0) {
             const aboveRow = validTier
@@ -570,6 +773,7 @@ export class ExternalDataService {
               try {
                 const stats = await this.fetchJson<Array<Record<string, unknown>>>(
                   `${DEADLOCK_API_BASE}/v1/players/hero-stats?account_ids=${chunk.join(',')}`,
+                  25_000,
                 );
                 if (Array.isArray(stats)) {
                   for (const h of stats) {
@@ -596,8 +800,10 @@ export class ExternalDataService {
               const played = byAccount.get(aid);
               if (!played || played.length === 0) continue;
               played.sort((a, b) => b.matches - a.matches);
-              const top5 = played.slice(0, 5).map((x) => x.heroId);
-              if (!validHeroIds.every((hid) => top5.includes(hid))) continue;
+              const topN =
+                validHeroIds.length === 1 ? 1 : validHeroIds.length === 2 ? 4 : 5;
+              const topAllowed = played.slice(0, topN).map((x) => x.heroId);
+              if (!validHeroIds.every((hid) => topAllowed.includes(hid))) continue;
               matched.push({
                 rank: above + idx + 1,
                 accountId: aid,
@@ -606,7 +812,7 @@ export class ExternalDataService {
                 rankedRank: null,
                 rankedSubrank: null,
                 points: Number(candidates[idx].points),
-                topHeroIds: top5.slice(0, 3),
+                topHeroIds: played.slice(0, 3).map((x) => x.heroId),
               });
             }
 
@@ -774,7 +980,14 @@ export class ExternalDataService {
       true,
     );
 
-    const totalEntries = snapshot ? snapshot.total : rawEntries.length;
+    const filteredRaw =
+      !snapshot && searchQuery.length >= 2
+        ? rawEntries.filter((e) =>
+            e.accountName.toLowerCase().includes(searchQuery.toLowerCase()),
+          )
+        : rawEntries;
+
+    const totalEntries = snapshot ? snapshot.total : filteredRaw.length;
     const totalPages = Math.max(1, Math.ceil(totalEntries / limit));
     const page = snapshot ? snapshot.page : Math.min(requestedPage, totalPages);
     const startIdx = (page - 1) * limit;
@@ -787,11 +1000,12 @@ export class ExternalDataService {
           rankedRank: null,
           rankedSubrank: null,
           points: row.points,
-          topHeroIds: [],
+          topHeroIds: row.topHeroes.slice(0, 3),
         }))
-      : rawEntries.slice(startIdx, startIdx + limit);
+      : filteredRaw.slice(startIdx, startIdx + limit);
 
-   const pageCacheKey = `leaderboard_page:v27:${snapshot ? 'snap' : 'raw'}:${region}:h${heroKey}:t${validTier ?? 0}:p${page}:l${limit}`;
+    const searchKey = searchQuery ? encodeURIComponent(searchQuery.toLowerCase()) : '';
+    const pageCacheKey = `leaderboard_page:v33:${snapshot ? 'snap' : 'raw'}:${region}:h${heroKey}:t${validTier ?? 0}:s${searchKey}:p${page}:l${limit}`;
 
     const [{ data: pageEntries, fetchedAt }, activeMap] = await Promise.all([
       this.withDbCache<NormalizedLeaderboardEntry[]>(
@@ -820,8 +1034,19 @@ export class ExternalDataService {
           );
 
           if (allIds.length > 0) {
-            if (snapshot) {
-              const rankMap = await fetchRanksBatch(allIds);
+            const [statsRes, steamRes, rankRes] = await Promise.allSettled([
+              this.fetchJson<Array<Record<string, unknown>>>(
+                `${DEADLOCK_API_BASE}/v1/players/hero-stats?account_ids=${allIds.join(',')}`,
+                25_000,
+              ),
+              this.fetchJson<Array<Record<string, unknown>>>(
+                `${DEADLOCK_API_BASE}/v1/players/steam?account_ids=${allIds.join(',')}`,
+              ),
+              snapshot ? fetchRanksBatch(allIds) : Promise.resolve(null),
+            ]);
+
+            if (rankRes.status === 'fulfilled' && rankRes.value) {
+              const rankMap = rankRes.value;
               for (const entry of entries) {
                 const row = entry.accountId ? rankMap.get(entry.accountId) : undefined;
                 if (!row) continue;
@@ -831,15 +1056,6 @@ export class ExternalDataService {
                   typeof row.subrank === 'number' && row.subrank > 0 ? row.subrank : null;
               }
             }
-
-            const [statsRes, steamRes] = await Promise.allSettled([
-              this.fetchJson<Array<Record<string, unknown>>>(
-                `${DEADLOCK_API_BASE}/v1/players/hero-stats?account_ids=${allIds.join(',')}`,
-              ),
-              this.fetchJson<Array<Record<string, unknown>>>(
-                `${DEADLOCK_API_BASE}/v1/players/steam?account_ids=${allIds.join(',')}`,
-              ),
-            ]);
 
             if (statsRes.status === 'rejected') {
               this.logger.warn(
@@ -944,6 +1160,56 @@ export class ExternalDataService {
       totalPages,
       totalEntries,
       entries: enriched,
+      fetchedAt,
+    };
+  }
+
+  async getPlayerbaseOverview(): Promise<PlayerbaseOverviewResponse> {
+    const [{ data: daily, fetchedAt }, rankedDistribution, regionRows] = await Promise.all([
+      this.withDbCache<Array<{ date: string; players: number; matches: number }>>(
+        'playerbase_daily:v1',
+        'deadlock-api',
+        3600,
+        async () => {
+          const sql =
+            "SELECT dateTrunc('day', start_time) AS dia, " +
+            'count(DISTINCT account_id) AS jogadores, ' +
+            'count(DISTINCT match_id) AS partidas ' +
+            'FROM match_player_latest ' +
+            'WHERE start_time > now() - INTERVAL 14 DAY ' +
+            'GROUP BY dia ORDER BY dia ASC';
+          const rows = await this.fetchJson<
+            Array<{ dia?: string; jogadores?: number | string; partidas?: number | string }>
+          >(
+            `${DEADLOCK_API_BASE}/v1/sql?format=json&query=${encodeURIComponent(sql)}`,
+            25_000,
+          );
+          if (!Array.isArray(rows)) return [];
+          return rows
+            .map((r) => ({
+              date: typeof r.dia === 'string' ? r.dia.slice(0, 10) : '',
+              players: Math.max(0, Number(r.jogadores ?? 0)),
+              matches: Math.max(0, Number(r.partidas ?? 0)),
+            }))
+            .filter((r) => r.date.length === 10);
+        },
+        true,
+      ),
+      this.getRankDistribution('Global'),
+      this.prisma.$queryRaw<Array<{ region: string | null; cnt: bigint }>>`
+        SELECT COALESCE(region, 'Desconhecida') AS region, COUNT(*)::bigint AS cnt
+        FROM leaderboard_snapshot
+        GROUP BY COALESCE(region, 'Desconhecida')
+        ORDER BY cnt DESC`.catch(() => []),
+    ]);
+
+    return {
+      daily,
+      rankedDistribution,
+      regions: regionRows.map((r) => ({
+        region: r.region || 'Desconhecida',
+        players: Number(r.cnt ?? 0),
+      })),
       fetchedAt,
     };
   }

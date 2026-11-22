@@ -15,6 +15,11 @@ export class ExternalDataController {
     return this.externalDataService.getRankDistribution(region);
   }
 
+  @Get('playerbase')
+  getPlayerbase() {
+    return this.externalDataService.getPlayerbaseOverview();
+  }
+
   @Get('player/:accountId/summary')
   getPlayerSummary(@Param('accountId') accountId: string) {
     return this.externalDataService.getPlayerSummary(accountId);
@@ -28,6 +33,7 @@ export class ExternalDataController {
     @Query('page') page?: string,
     @Query('limit') limit?: string,
     @Query('tier') tier?: string,
+    @Query('search') search?: string,
   ) {
     const parsedHeroIds = (heroIds ? heroIds.split(',') : heroId ? [heroId] : [])
       .map((v) => Number(v.trim()))
@@ -42,6 +48,7 @@ export class ExternalDataController {
       parsedPage,
       parsedLimit,
       parsedTier,
+      search,
     );
   }
 
