@@ -60,9 +60,15 @@ export interface NormalizedLeaderboardEntry {
   topHeroIds: number[];
 }
 
+export interface RankDistributionSubrank {
+  subrank: number;
+  uniquePlayers: number;
+}
+
 export interface RankDistributionTier {
   tier: number;
   uniquePlayers: number;
+  subranks?: RankDistributionSubrank[];
 }
 
 export interface RankDistributionResponse {

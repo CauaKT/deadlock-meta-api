@@ -1184,14 +1184,68 @@ export class ExternalDataService {
             `${DEADLOCK_API_BASE}/v1/sql?format=json&query=${encodeURIComponent(sql)}`,
             25_000,
           );
-          if (!Array.isArray(rows)) return [];
-          return rows
-            .map((r) => ({
-              date: typeof r.dia === 'string' ? r.dia.slice(0, 10) : '',
-              players: Math.max(0, Number(r.jogadores ?? 0)),
-              matches: Math.max(0, Number(r.partidas ?? 0)),
-            }))
-            .filter((r) => r.date.length === 10);
+          const fresh = Array.isArray(rows)
+            ? rows
+                .map((r) => ({
+                  date: typeof r.dia === 'string' ? r.dia.slice(0, 10) : '',
+                  players: Math.max(0, Number(r.jogadores ?? 0)),
+                  matches: Math.max(0, Number(r.partidas ?? 0)),
+                }))
+                .filter((r) => r.date.length === 10)
+            : [];
+
+          const historyKey = 'playerbase_daily_history:v1';
+          const existing = await this.prisma.externalCache.findUnique({
+            where: { key: historyKey },
+          });
+          const merged = new Map<string, { date: string; players: number; matches: number }>();
+
+          if (existing && Array.isArray(existing.payload)) {
+            for (const item of existing.payload as Array<{
+              date?: unknown;
+              players?: unknown;
+              matches?: unknown;
+            }>) {
+              if (typeof item?.date === 'string' && item.date.length === 10) {
+                merged.set(item.date, {
+                  date: item.date,
+                  players: Math.max(0, Number(item.players ?? 0)),
+                  matches: Math.max(0, Number(item.matches ?? 0)),
+                });
+              }
+            }
+          }
+
+          for (const item of fresh) {
+            const prev = merged.get(item.date);
+            merged.set(item.date, {
+              date: item.date,
+              players: Math.max(prev?.players ?? 0, item.players),
+              matches: Math.max(prev?.matches ?? 0, item.matches),
+            });
+          }
+
+          const allDays = [...merged.values()].sort((a, b) => a.date.localeCompare(b.date));
+          if (allDays.length > 0) {
+            const now = new Date();
+            await this.prisma.externalCache.upsert({
+              where: { key: historyKey },
+              create: {
+                key: historyKey,
+                source: 'deadlock-api',
+                payload: allDays as unknown as Prisma.InputJsonValue,
+                fetchedAt: now,
+                expiresAt: new Date('2099-01-01T00:00:00.000Z'),
+              },
+              update: {
+                payload: allDays as unknown as Prisma.InputJsonValue,
+                fetchedAt: now,
+                expiresAt: new Date('2099-01-01T00:00:00.000Z'),
+              },
+            });
+          }
+
+          return allDays;
         },
         true,
       ),
@@ -1256,13 +1310,14 @@ export class ExternalDataService {
     const { data, fetchedAt } = await this.withDbCache<{
       totalPlayers: number;
       tiers: RankDistributionTier[];
-    }>('rank_distribution:v2:14d', 'deadlock-api', 3600, async () => {
+    }>('rank_distribution:v3:14d', 'deadlock-api', 3600, async () => {
       const minTs = Math.floor(Date.now() / 1000) - 14 * 86400;
       const rows = await this.fetchJson<
         Array<{ badge_level?: number; unique_players?: number }>
       >(`${DEADLOCK_API_BASE}/v1/analytics/badge-distribution?min_unix_timestamp=${minTs}`);
 
       const byTier = new Map<number, number>();
+      const bySubrank = new Map<string, number>();
       let totalPlayers = 0;
 
       if (Array.isArray(rows)) {
@@ -1270,8 +1325,13 @@ export class ExternalDataService {
           const level = Number(r.badge_level ?? 0);
           const count = Number(r.unique_players ?? 0);
           const tier = Math.floor(level / 10);
+          const subrank = level % 10;
           if (tier >= 1 && tier <= 11 && count > 0) {
             byTier.set(tier, (byTier.get(tier) ?? 0) + count);
+            if (subrank >= 1 && subrank <= 6) {
+              const key = `${tier}:${subrank}`;
+              bySubrank.set(key, (bySubrank.get(key) ?? 0) + count);
+            }
             totalPlayers += count;
           }
         }
@@ -1279,7 +1339,11 @@ export class ExternalDataService {
 
       const tiers: RankDistributionTier[] = [];
       for (let t = 11; t >= 1; t -= 1) {
-        tiers.push({ tier: t, uniquePlayers: byTier.get(t) ?? 0 });
+        const subranks = [1, 2, 3, 4, 5, 6].map((sub) => ({
+          subrank: sub,
+          uniquePlayers: bySubrank.get(`${t}:${sub}`) ?? 0,
+        }));
+        tiers.push({ tier: t, uniquePlayers: byTier.get(t) ?? 0, subranks });
       }
 
       return { totalPlayers, tiers };
