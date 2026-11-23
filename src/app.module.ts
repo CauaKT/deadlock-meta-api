@@ -36,6 +36,7 @@ import { TournamentsModule } from './tournaments/tournaments.module';
     ProfilesModule,
     AdminModule,
     TierListsModule,
+    BuildsModule,
     FeedModule,
     FriendsModule,
     ExternalDataModule,
