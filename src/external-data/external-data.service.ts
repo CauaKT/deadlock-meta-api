@@ -20,11 +20,17 @@ import type {
   RankDistributionTier,
 } from './external-data.types';
 
-const DEADLOCK_API_BASE = 'https://api.deadlock-api.com';
-const STEAM64_BASE = 76561197960265728n;
-
-const REGIONAL_LIST = ['Europe', 'NAmerica', 'SAmerica', 'Asia', 'Oceania'] as const;
-const ALLOWED_REGIONS = new Set<string>(['Global', ...REGIONAL_LIST]);
+import {
+  ALLOWED_REGIONS,
+  DEADLOCK_API_BASE,
+  DEFAULT_LEADERBOARD_REGION,
+  EXTERNAL_CACHE_TTL_SECONDS,
+  LEADERBOARD_LIMIT_CONFIG,
+  MAX_RANK_TIER,
+  RANK_POINTS_PER_TIER,
+  REGIONAL_LIST,
+  STEAM64_BASE,
+} from './external-data.config';
 
 @Injectable()
 export class ExternalDataService {
@@ -151,7 +157,7 @@ export class ExternalDataService {
     const { data, fetchedAt } = await this.withDbCache<Omit<NormalizedPlayerSummary, 'fetchedAt'>>(
       cacheKey,
       'deadlock-api',
-      900,
+      EXTERNAL_CACHE_TTL_SECONDS.playerSummary,
       async () => {
         const [heroRes, historyRes, mmrRes, rankRes, steamRes] = await Promise.allSettled([
           this.fetchJson<Array<Record<string, unknown>>>(
@@ -276,7 +282,11 @@ export class ExternalDataService {
     try {
       const { data } = await this.withDbCache<
         Record<string, { matchId: number; heroId: number; startTime: number }>
-      >('active_matches_map', 'deadlock-api', 60, async () => {
+      >(
+        'active_matches_map',
+        'deadlock-api',
+        EXTERNAL_CACHE_TTL_SECONDS.activeMatches,
+        async () => {
         const list = await this.fetchJson<
           Array<{
             match_id?: number;
@@ -330,8 +340,8 @@ export class ExternalDataService {
         if (!hasAny[0]?.ok) return null;
       }
 
-      const lo = tier ? 6500 * (tier - 1) : -1000000;
-      const hi = tier && tier < 11 ? 6500 * tier : 1000000000;
+      const lo = tier ? RANK_POINTS_PER_TIER * (tier - 1) : -1000000;
+      const hi = tier && tier < MAX_RANK_TIER ? RANK_POINTS_PER_TIER * tier : 1000000000;
       const regionSql =
         region === 'Global' ? Prisma.empty : Prisma.sql`AND region = ${region}`;
       const heroSql =
@@ -513,8 +523,8 @@ export class ExternalDataService {
         return { total: 0, page: 1, rows: [] };
       }
 
-      const lo = tier ? 6500 * (tier - 1) : -1000000;
-      const hi = tier && tier < 11 ? 6500 * tier : 1000000000;
+      const lo = tier ? RANK_POINTS_PER_TIER * (tier - 1) : -1000000;
+      const hi = tier && tier < MAX_RANK_TIER ? RANK_POINTS_PER_TIER * tier : 1000000000;
       const regionSql =
         region === 'Global' ? Prisma.empty : Prisma.sql`AND region = ${region}`;
       const heroSql =
@@ -570,11 +580,11 @@ export class ExternalDataService {
     rawRegion: string,
     heroIds?: number[] | number,
     rawPage = 1,
-    rawLimit = 25,
+    rawLimit: number = LEADERBOARD_LIMIT_CONFIG.defaultLimit,
     rawTier?: number,
     rawSearch?: string,
   ): Promise<NormalizedLeaderboardResponse> {
-    const region = ALLOWED_REGIONS.has(rawRegion) ? rawRegion : 'SAmerica';
+    const region = ALLOWED_REGIONS.has(rawRegion) ? rawRegion : DEFAULT_LEADERBOARD_REGION;
     const rawHeroList = Array.isArray(heroIds)
       ? heroIds
       : typeof heroIds === 'number'
@@ -582,17 +592,30 @@ export class ExternalDataService {
         : [];
     const validHeroIds = Array.from(
       new Set(rawHeroList.filter((id) => Number.isInteger(id) && id > 0)),
-    ).slice(0, 3);
+    ).slice(0, LEADERBOARD_LIMIT_CONFIG.maxHeroFilterCount);
     const validHeroId = validHeroIds[0] ?? null;
     const heroKey =
       validHeroIds.length > 0 ? [...validHeroIds].sort((a, b) => a - b).join(',') : '0';
-    const limit = Number.isFinite(rawLimit) ? Math.max(10, Math.min(50, Math.floor(rawLimit))) : 25;
-    const requestedPage = Number.isFinite(rawPage) ? Math.max(1, Math.min(20000, Math.floor(rawPage))) : 1;
+    const limit = Number.isFinite(rawLimit)
+      ? Math.max(
+          LEADERBOARD_LIMIT_CONFIG.minLimit,
+          Math.min(LEADERBOARD_LIMIT_CONFIG.maxLimit, Math.floor(rawLimit)),
+        )
+      : LEADERBOARD_LIMIT_CONFIG.defaultLimit;
+    const requestedPage = Number.isFinite(rawPage)
+      ? Math.max(1, Math.min(LEADERBOARD_LIMIT_CONFIG.maxPageLimit, Math.floor(rawPage)))
+      : 1;
     const validTier =
-      typeof rawTier === 'number' && Number.isInteger(rawTier) && rawTier >= 1 && rawTier <= 11
+      typeof rawTier === 'number' &&
+      Number.isInteger(rawTier) &&
+      rawTier >= 1 &&
+      rawTier <= MAX_RANK_TIER
         ? rawTier
         : null;
-    const searchQuery = typeof rawSearch === 'string' ? rawSearch.trim().slice(0, 64) : '';
+    const searchQuery =
+      typeof rawSearch === 'string'
+        ? rawSearch.trim().slice(0, LEADERBOARD_LIMIT_CONFIG.maxSearchChars)
+        : '';
 
     const rawCacheKey =
       validHeroIds.length > 0
@@ -685,11 +708,14 @@ export class ExternalDataService {
         ? `leaderboard_raw:v10:${region}:t${validTier ?? 0}:heroes:${heroKey}`
         : rawCacheKey,
       'deadlock-api',
-      1800,
+      EXTERNAL_CACHE_TTL_SECONDS.leaderboardRaw,
       async () => {
         if (validHeroIds.length > 0) {
-          const lo = validTier ? 6500 * (validTier - 1) : -1000000;
-          const hi = validTier && validTier < 11 ? 6500 * validTier : 1000000000;
+          const lo = validTier ? RANK_POINTS_PER_TIER * (validTier - 1) : -1000000;
+          const hi =
+            validTier && validTier < MAX_RANK_TIER
+              ? RANK_POINTS_PER_TIER * validTier
+              : 1000000000;
           const isGlobal = region === 'Global';
 
           let candidates: Array<{ account_id: bigint; points: number }> = [];
@@ -1011,7 +1037,7 @@ export class ExternalDataService {
       this.withDbCache<NormalizedLeaderboardEntry[]>(
         pageCacheKey,
         'deadlock-api',
-        1800,
+        EXTERNAL_CACHE_TTL_SECONDS.leaderboardPage,
         async () => {
           const entries: NormalizedLeaderboardEntry[] = pageSlice.map((item) => ({
             rank: item.rank,
@@ -1169,7 +1195,7 @@ export class ExternalDataService {
       this.withDbCache<Array<{ date: string; players: number; matches: number }>>(
         'playerbase_daily:v1',
         'deadlock-api',
-        3600,
+        EXTERNAL_CACHE_TTL_SECONDS.playerbaseDaily,
         async () => {
           const sql =
             "SELECT dateTrunc('day', start_time) AS dia, " +
@@ -1276,9 +1302,14 @@ export class ExternalDataService {
 
     if (region !== 'Global') {
       try {
+        const maxTierSql = Prisma.raw(String(MAX_RANK_TIER));
+        const maxTierThresholdSql = Prisma.raw(
+          String(RANK_POINTS_PER_TIER * (MAX_RANK_TIER - 1)),
+        );
+        const stepSql = Prisma.raw(String(RANK_POINTS_PER_TIER));
         const snapRows = await this.prisma.$queryRaw<Array<{ tier: number; cnt: bigint }>>`
           SELECT
-            LEAST(11, GREATEST(1, CASE WHEN points >= 65000 THEN 11 ELSE (points / 6500)::int + 1 END))::int AS tier,
+            LEAST(${maxTierSql}, GREATEST(1, CASE WHEN points >= ${maxTierThresholdSql} THEN ${maxTierSql} ELSE (points / ${stepSql})::int + 1 END))::int AS tier,
             COUNT(*)::bigint AS cnt
           FROM leaderboard_snapshot
           WHERE region = ${region}
@@ -1289,13 +1320,13 @@ export class ExternalDataService {
           let totalPlayers = 0;
           for (const r of snapRows) {
             const count = Number(r.cnt ?? 0);
-            if (r.tier >= 1 && r.tier <= 11 && count > 0) {
+            if (r.tier >= 1 && r.tier <= MAX_RANK_TIER && count > 0) {
               byTier.set(r.tier, count);
               totalPlayers += count;
             }
           }
           const tiers: RankDistributionTier[] = [];
-          for (let t = 11; t >= 1; t -= 1) {
+          for (let t = MAX_RANK_TIER; t >= 1; t -= 1) {
             tiers.push({ tier: t, uniquePlayers: byTier.get(t) ?? 0 });
           }
           return { totalPlayers, tiers, fetchedAt: new Date().toISOString() };
@@ -1362,7 +1393,7 @@ export class ExternalDataService {
     const { data, fetchedAt } = await this.withDbCache<Omit<NormalizedMatchDetail, 'fetchedAt'>>(
       cacheKey,
       'deadlock-api',
-      86400,
+      EXTERNAL_CACHE_TTL_SECONDS.matchDetail,
       async () => {
         const raw = await this.fetchJson<{
           match_info?: Record<string, unknown>;
@@ -1426,7 +1457,7 @@ export class ExternalDataService {
           id: 'deadlock-api',
           name: 'Deadlock API (Comunitária)',
           baseUrl: DEADLOCK_API_BASE,
-          ttlSeconds: 900,
+          ttlSeconds: EXTERNAL_CACHE_TTL_SECONDS.playerSummary,
         },
       ],
     };
