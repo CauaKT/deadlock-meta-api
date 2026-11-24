@@ -95,7 +95,9 @@ model TierList {
   user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
   title      String
   authorName String?  @map("author_name")
+  style      String   @default("classic")
   tiers      Json
+  quadrant   Json?
   createdAt  DateTime @default(now()) @map("created_at")
   updatedAt  DateTime @updatedAt @map("updated_at")
 
