@@ -3,7 +3,12 @@ import { PrismaService } from '../prisma/prisma.service';
 
 export interface NotificationItem {
   id: string;
-  type: 'friend_request' | 'post_like' | 'post_comment';
+  type:
+    | 'friend_request'
+    | 'post_like'
+    | 'post_comment'
+    | 'tier_list_like'
+    | 'tier_list_comment';
   actorName: string;
   actorHandle: string | null;
   message: string;
@@ -16,7 +21,7 @@ export class NotificationsService {
   constructor(private readonly prisma: PrismaService) {}
 
   async getRecent(userId: string): Promise<NotificationItem[]> {
-    const [friendRequests, likes, comments] = await Promise.all([
+    const [friendRequests, likes, comments, tierLikes, tierComments] = await Promise.all([
       this.prisma.friendship.findMany({
         where: { addresseeId: userId, status: 'PENDING' },
         orderBy: { createdAt: 'desc' },
@@ -54,6 +59,32 @@ export class NotificationsService {
           },
         },
       }),
+      this.prisma.tierListLike.findMany({
+        where: { tierList: { userId }, userId: { not: userId } },
+        orderBy: { createdAt: 'desc' },
+        take: 10,
+        include: {
+          user: {
+            select: {
+              profile: { select: { username: true, handle: true } },
+            },
+          },
+          tierList: { select: { id: true, title: true } },
+        },
+      }),
+      this.prisma.tierListComment.findMany({
+        where: { tierList: { userId }, userId: { not: userId } },
+        orderBy: { createdAt: 'desc' },
+        take: 10,
+        include: {
+          user: {
+            select: {
+              profile: { select: { username: true, handle: true } },
+            },
+          },
+          tierList: { select: { id: true, title: true } },
+        },
+      }),
     ]);
 
     const list: NotificationItem[] = [
@@ -83,6 +114,24 @@ export class NotificationsService {
         message: `comentou no seu post: "${cm.content.slice(0, 40)}"`,
         href: '/feed',
         createdAt: cm.createdAt.toISOString(),
+      })),
+      ...tierLikes.map((tl) => ({
+        id: `tll-${tl.id}`,
+        type: 'tier_list_like' as const,
+        actorName: tl.user.profile?.username || 'Jogador',
+        actorHandle: tl.user.profile?.handle ?? null,
+        message: `curtiu sua tier list: "${tl.tierList.title.slice(0, 40)}"`,
+        href: `/tier-maker/comunidade/${tl.tierList.id}`,
+        createdAt: tl.createdAt.toISOString(),
+      })),
+      ...tierComments.map((tc) => ({
+        id: `tlc-${tc.id}`,
+        type: 'tier_list_comment' as const,
+        actorName: tc.user.profile?.username || 'Jogador',
+        actorHandle: tc.user.profile?.handle ?? null,
+        message: `comentou na tier list "${tc.tierList.title.slice(0, 28)}": "${tc.content.slice(0, 32)}"`,
+        href: `/tier-maker/comunidade/${tc.tierList.id}`,
+        createdAt: tc.createdAt.toISOString(),
       })),
     ];
 

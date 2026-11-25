@@ -2,6 +2,7 @@ import { Transform } from 'class-transformer';
 import {
   IsOptional,
   IsString,
+  IsUUID,
   Length,
   Matches,
   MaxLength,
@@ -35,6 +36,12 @@ export class CreatePostDto {
     message: 'Use apenas links http:// ou https:// (imagens em base64 não são permitidas).',
   })
   mediaUrl?: string | null;
+
+  @IsOptional()
+  @Transform(emptyToNull)
+  @ValidateIf((_, value) => value !== null && value !== undefined)
+  @IsUUID('4', { message: 'Tier list inválida.' })
+  tierListId?: string | null;
 }
 
 export class CreateCommentDto {

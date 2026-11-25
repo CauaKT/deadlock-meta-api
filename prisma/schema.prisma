@@ -34,9 +34,11 @@ model User {
   emailVerified      Boolean     @default(false) @map("email_verified")
   mustChangePassword Boolean     @default(false) @map("must_change_password")
   sessionVersion     Int         @default(1) @map("session_version")
-  profile       Profile?
-  tierLists     TierList[]
-  builds        Build[]
+  profile          Profile?
+  tierLists        TierList[]
+  tierListLikes    TierListLike[]
+  tierListComments TierListComment[]
+  builds           Build[]
   authTokens    AuthToken[]
   posts               Post[]
   postComments        PostComment[]
@@ -90,18 +92,51 @@ model Profile {
 }
 
 model TierList {
+  id          String            @id @default(uuid())
+  userId      String?           @map("user_id")
+  user        User?             @relation(fields: [userId], references: [id], onDelete: SetNull)
+  title       String
+  description String?
+  authorName  String?           @map("author_name")
+  style       String            @default("classic")
+  tiers       Json
+  quadrant    Json?
+  viewsCount  Int               @default(0) @map("views_count")
+  likes       TierListLike[]
+  comments    TierListComment[]
+  feedPosts   Post[]
+  createdAt   DateTime          @default(now()) @map("created_at")
+  updatedAt   DateTime          @updatedAt @map("updated_at")
+
+  @@index([createdAt(sort: Desc)])
+  @@map("tier_lists")
+}
+
+model TierListLike {
   id         String   @id @default(uuid())
-  userId     String?  @map("user_id")
-  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
-  title      String
-  authorName String?  @map("author_name")
-  style      String   @default("classic")
-  tiers      Json
-  quadrant   Json?
+  tierListId String   @map("tier_list_id")
+  tierList   TierList @relation(fields: [tierListId], references: [id], onDelete: Cascade)
+  userId     String   @map("user_id")
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@unique([tierListId, userId])
+  @@index([tierListId])
+  @@map("tier_list_likes")
+}
+
+model TierListComment {
+  id         String   @id @default(uuid())
+  tierListId String   @map("tier_list_id")
+  tierList   TierList @relation(fields: [tierListId], references: [id], onDelete: Cascade)
+  userId     String   @map("user_id")
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  content    String
   createdAt  DateTime @default(now()) @map("created_at")
   updatedAt  DateTime @updatedAt @map("updated_at")
 
-  @@map("tier_lists")
+  @@index([tierListId, createdAt])
+  @@map("tier_list_comments")
 }
 
 model Build {
@@ -120,17 +155,20 @@ model Build {
 }
 
 model Post {
-  id        String        @id @default(uuid())
-  userId    String        @map("user_id")
-  user      User          @relation(fields: [userId], references: [id], onDelete: Cascade)
-  content   String
-  mediaUrl  String?       @map("media_url")
-  comments  PostComment[]
-  likes     PostLike[]
-  createdAt DateTime      @default(now()) @map("created_at")
-  updatedAt DateTime      @updatedAt @map("updated_at")
+  id         String        @id @default(uuid())
+  userId     String        @map("user_id")
+  user       User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  content    String
+  mediaUrl   String?       @map("media_url")
+  tierListId String?       @map("tier_list_id")
+  tierList   TierList?     @relation(fields: [tierListId], references: [id], onDelete: SetNull)
+  comments   PostComment[]
+  likes      PostLike[]
+  createdAt  DateTime      @default(now()) @map("created_at")
+  updatedAt  DateTime      @updatedAt @map("updated_at")
 
   @@index([createdAt(sort: Desc)])
+  @@index([tierListId])
   @@map("posts")
 }
 

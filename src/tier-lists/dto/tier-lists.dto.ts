@@ -13,6 +13,7 @@ import {
   Length,
   Matches,
   Max,
+  MaxLength,
   Min,
   ValidateIf,
   ValidateNested,
@@ -20,6 +21,15 @@ import {
 
 const trimString = ({ value }: { value: unknown }) =>
   typeof value === 'string' ? value.trim() : value;
+
+const emptyToNull = ({ value }: { value: unknown }) => {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string') {
+    const t = value.trim();
+    return t === '' ? null : t;
+  }
+  return value;
+};
 
 export class TierRowDto {
   @Transform(trimString)
@@ -58,25 +68,42 @@ export class TierQuadrantItemDto {
 }
 
 export class TierQuadrantDto {
+  @ValidateIf((o: TierQuadrantDto) => !Array.isArray(o.axes) || o.axes.length === 0)
   @Transform(trimString)
   @IsString({ message: 'Rótulo superior inválido.' })
   @Length(1, 35, { message: 'Rótulo superior deve ter entre 1 e 35 caracteres.' })
-  topLabel!: string;
+  topLabel?: string;
 
+  @ValidateIf((o: TierQuadrantDto) => !Array.isArray(o.axes) || o.axes.length === 0)
   @Transform(trimString)
   @IsString({ message: 'Rótulo inferior inválido.' })
   @Length(1, 35, { message: 'Rótulo inferior deve ter entre 1 e 35 caracteres.' })
-  bottomLabel!: string;
+  bottomLabel?: string;
 
+  @ValidateIf((o: TierQuadrantDto) => !Array.isArray(o.axes) || o.axes.length === 0)
   @Transform(trimString)
   @IsString({ message: 'Rótulo esquerdo inválido.' })
   @Length(1, 35, { message: 'Rótulo esquerdo deve ter entre 1 e 35 caracteres.' })
-  leftLabel!: string;
+  leftLabel?: string;
 
+  @ValidateIf((o: TierQuadrantDto) => !Array.isArray(o.axes) || o.axes.length === 0)
   @Transform(trimString)
   @IsString({ message: 'Rótulo direito inválido.' })
   @Length(1, 35, { message: 'Rótulo direito deve ter entre 1 e 35 caracteres.' })
-  rightLabel!: string;
+  rightLabel?: string;
+
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) =>
+    Array.isArray(value)
+      ? value.map((v) => (typeof v === 'string' ? v.trim() : v))
+      : value,
+  )
+  @IsArray({ message: 'Eixos do gráfico inválidos.' })
+  @ArrayMinSize(3, { message: 'O gráfico precisa ter pelo menos 3 pontas.' })
+  @ArrayMaxSize(10, { message: 'O gráfico pode ter no máximo 10 pontas.' })
+  @IsString({ each: true, message: 'Rótulo de eixo inválido.' })
+  @Length(1, 35, { each: true, message: 'Cada rótulo deve ter entre 1 e 35 caracteres.' })
+  axes?: string[];
 
   @IsArray({ message: 'Itens do gráfico 2D inválidos.' })
   @ArrayMaxSize(200, { message: 'Limite de heróis no gráfico excedido.' })
@@ -90,6 +117,13 @@ export class CreateTierListDto {
   @IsString({ message: 'Título inválido.' })
   @Length(1, 80, { message: 'Título deve ter entre 1 e 80 caracteres.' })
   title!: string;
+
+  @IsOptional()
+  @Transform(emptyToNull)
+  @ValidateIf((_, value) => value !== null && value !== undefined)
+  @IsString({ message: 'Descrição inválida.' })
+  @MaxLength(280, { message: 'Descrição deve ter no máximo 280 caracteres.' })
+  description?: string | null;
 
   @IsOptional()
   @IsIn(['classic', 'quadrant'], { message: 'Estilo de tier list inválido.' })
@@ -112,3 +146,10 @@ export class CreateTierListDto {
 }
 
 export class UpdateTierListDto extends CreateTierListDto {}
+
+export class CreateTierListCommentDto {
+  @Transform(trimString)
+  @IsString({ message: 'O comentário é obrigatório.' })
+  @Length(1, 300, { message: 'O comentário deve ter entre 1 e 300 caracteres.' })
+  content!: string;
+}
