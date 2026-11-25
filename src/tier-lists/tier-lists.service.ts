@@ -47,9 +47,13 @@ export interface TierListCommentAuthorView {
 export interface TierListCommentView {
   id: string;
   tierListId: string;
+  parentId: string | null;
   content: string;
   createdAt: string;
   author: TierListCommentAuthorView;
+  likesCount: number;
+  likedByMe: boolean;
+  repliesCount: number;
   canDelete: boolean;
 }
 
@@ -68,8 +72,10 @@ export interface TierListView {
   quadrant: TierQuadrantView | null;
   viewsCount: number;
   likesCount: number;
+  savesCount: number;
   commentsCount: number;
   likedByMe: boolean;
+  savedByMe: boolean;
   relevanceScore: number;
   recentComments: TierListCommentView[];
   comments?: TierListCommentView[];
@@ -89,6 +95,21 @@ const commentAuthorSelect = {
   },
 } satisfies Prisma.UserSelect;
 
+function commentInclude(viewerId?: string) {
+  return {
+    user: { select: commentAuthorSelect },
+    _count: {
+      select: {
+        likes: true,
+        replies: true,
+      },
+    },
+    likes: viewerId
+      ? { where: { userId: viewerId }, select: { id: true } }
+      : false,
+  } satisfies Prisma.TierListCommentInclude;
+}
+
 function tierListInclude(viewerId?: string, fullComments = false) {
   return {
     user: {
@@ -106,18 +127,20 @@ function tierListInclude(viewerId?: string, fullComments = false) {
     _count: {
       select: {
         likes: true,
+        saves: true,
         comments: true,
       },
     },
     likes: viewerId
       ? { where: { userId: viewerId }, select: { id: true } }
       : false,
+    saves: viewerId
+      ? { where: { userId: viewerId }, select: { id: true } }
+      : false,
     comments: {
       orderBy: { createdAt: fullComments ? ('asc' as const) : ('desc' as const) },
       ...(fullComments ? {} : { take: 3 }),
-      include: {
-        user: { select: commentAuthorSelect },
-      },
+      include: commentInclude(viewerId),
     },
   } satisfies Prisma.TierListInclude;
 }
@@ -240,9 +263,12 @@ function toCommentView(
   c: {
     id: string;
     tierListId: string;
+    parentId: string | null;
     userId: string;
     content: string;
     createdAt: Date;
+    _count?: { likes: number; replies: number };
+    likes?: Array<{ id: string }> | false;
     user: {
       id: string;
       profile: {
@@ -265,6 +291,7 @@ function toCommentView(
   return {
     id: c.id,
     tierListId: c.tierListId,
+    parentId: c.parentId ?? null,
     content: c.content,
     createdAt: c.createdAt.toISOString(),
     author: {
@@ -274,6 +301,9 @@ function toCommentView(
       avatarUrl: c.user.profile?.avatarUrl ?? null,
       favoriteHeroId: c.user.profile?.favoriteHeroId ?? null,
     },
+    likesCount: c._count?.likes ?? 0,
+    likedByMe: Array.isArray(c.likes) && c.likes.length > 0,
+    repliesCount: c._count?.replies ?? 0,
     canDelete,
   };
 }
@@ -312,8 +342,10 @@ export class TierListsService {
       row.style === 'quadrant' ? 'quadrant' : 'classic';
 
     const likesCount = row._count?.likes ?? 0;
+    const savesCount = row._count?.saves ?? 0;
     const commentsCount = row._count?.comments ?? 0;
     const likedByMe = Array.isArray(row.likes) && row.likes.length > 0;
+    const savedByMe = Array.isArray(row.saves) && row.saves.length > 0;
     const viewsCount = row.viewsCount ?? 0;
 
     const mappedComments = (row.comments ?? []).map((c) =>
@@ -338,8 +370,10 @@ export class TierListsService {
       quadrant: style === 'quadrant' ? parseQuadrantJson(row.quadrant) : null,
       viewsCount,
       likesCount,
+      savesCount,
       commentsCount,
       likedByMe,
+      savedByMe,
       relevanceScore: computeRelevanceScore(
         likesCount,
         commentsCount,
@@ -363,6 +397,7 @@ export class TierListsService {
       search?: string;
       heroId?: number;
       likedByMe?: boolean;
+      savedByMe?: boolean;
     },
   ): Promise<TierListView[]> {
     const cleanUserId = filters?.userId?.trim();
@@ -389,6 +424,12 @@ export class TierListsService {
     if (filters?.likedByMe && viewer) {
       andConditions.push({
         likes: { some: { userId: viewer.userId } },
+      });
+    }
+
+    if (filters?.savedByMe && viewer) {
+      andConditions.push({
+        saves: { some: { userId: viewer.userId } },
       });
     }
 
@@ -651,6 +692,40 @@ export class TierListsService {
     return { liked, likesCount };
   }
 
+  async toggleSave(
+    id: string,
+    user: AuthenticatedUser,
+  ): Promise<{ saved: boolean; savesCount: number }> {
+    const existingList = await this.prisma.tierList.findUnique({
+      where: { id },
+      select: { id: true },
+    });
+    if (!existingList) {
+      throw new NotFoundException('Tier list não encontrada.');
+    }
+
+    const existing = await this.prisma.tierListSave.findUnique({
+      where: { tierListId_userId: { tierListId: id, userId: user.userId } },
+      select: { id: true },
+    });
+
+    let saved = false;
+    if (existing) {
+      await this.prisma.tierListSave.delete({ where: { id: existing.id } });
+    } else {
+      await this.prisma.tierListSave.create({
+        data: { tierListId: id, userId: user.userId },
+      });
+      saved = true;
+    }
+
+    const savesCount = await this.prisma.tierListSave.count({
+      where: { tierListId: id },
+    });
+
+    return { saved, savesCount };
+  }
+
   async recordView(id: string): Promise<{ viewsCount: number }> {
     const existing = await this.prisma.tierList.findUnique({
       where: { id },
@@ -684,7 +759,7 @@ export class TierListsService {
     const rows = await this.prisma.tierListComment.findMany({
       where: { tierListId: id },
       orderBy: { createdAt: 'asc' },
-      include: { user: { select: commentAuthorSelect } },
+      include: commentInclude(viewer?.userId),
     });
 
     return rows.map((c) => toCommentView(c, list.userId, viewer));
@@ -703,18 +778,63 @@ export class TierListsService {
       throw new NotFoundException('Tier list não encontrada.');
     }
 
+    if (dto.parentId) {
+      const parent = await this.prisma.tierListComment.findUnique({
+        where: { id: dto.parentId },
+        select: { id: true, tierListId: true },
+      });
+      if (!parent || parent.tierListId !== id) {
+        throw new NotFoundException('Comentário pai não encontrado.');
+      }
+    }
+
     await this.moderation.assertSafeContent({ texts: [dto.content] });
 
     const created = await this.prisma.tierListComment.create({
       data: {
         tierListId: id,
         userId: user.userId,
+        parentId: dto.parentId ?? null,
         content: dto.content,
       },
-      include: { user: { select: commentAuthorSelect } },
+      include: commentInclude(user.userId),
     });
 
     return toCommentView(created, list.userId, user);
+  }
+
+  async toggleCommentLike(
+    commentId: string,
+    user: AuthenticatedUser,
+  ): Promise<{ liked: boolean; likesCount: number }> {
+    const existingComment = await this.prisma.tierListComment.findUnique({
+      where: { id: commentId },
+      select: { id: true },
+    });
+    if (!existingComment) {
+      throw new NotFoundException('Comentário não encontrado.');
+    }
+
+    const existing = await this.prisma.tierListCommentLike.findUnique({
+      where: { commentId_userId: { commentId, userId: user.userId } },
+      select: { id: true },
+    });
+
+    let liked = false;
+    if (existing) {
+      await this.prisma.tierListCommentLike.delete({ where: { id: existing.id } });
+    } else {
+      await this.prisma.tierListCommentLike.create({
+        data: { commentId, userId: user.userId },
+      });
+      liked = true;
+    }
+
+    const likesCount = await this.prisma.tierListCommentLike.count({
+      where: { commentId },
+    });
+
+    return { liked, likesCount };
   }
 
   async removeComment(

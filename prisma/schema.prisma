@@ -35,10 +35,12 @@ model User {
   mustChangePassword Boolean     @default(false) @map("must_change_password")
   sessionVersion     Int         @default(1) @map("session_version")
   profile          Profile?
-  tierLists        TierList[]
-  tierListLikes    TierListLike[]
-  tierListComments TierListComment[]
-  builds           Build[]
+  tierLists            TierList[]
+  tierListLikes        TierListLike[]
+  tierListSaves        TierListSave[]
+  tierListComments     TierListComment[]
+  tierListCommentLikes TierListCommentLike[]
+  builds               Build[]
   authTokens    AuthToken[]
   posts               Post[]
   postComments        PostComment[]
@@ -103,6 +105,7 @@ model TierList {
   quadrant    Json?
   viewsCount  Int               @default(0) @map("views_count")
   likes       TierListLike[]
+  saves       TierListSave[]
   comments    TierListComment[]
   feedPosts   Post[]
   createdAt   DateTime          @default(now()) @map("created_at")
@@ -125,18 +128,50 @@ model TierListLike {
   @@map("tier_list_likes")
 }
 
-model TierListComment {
+model TierListSave {
   id         String   @id @default(uuid())
   tierListId String   @map("tier_list_id")
   tierList   TierList @relation(fields: [tierListId], references: [id], onDelete: Cascade)
   userId     String   @map("user_id")
   user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  content    String
   createdAt  DateTime @default(now()) @map("created_at")
-  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@unique([tierListId, userId])
+  @@index([tierListId])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("tier_list_saves")
+}
+
+model TierListComment {
+  id         String                @id @default(uuid())
+  tierListId String                @map("tier_list_id")
+  tierList   TierList              @relation(fields: [tierListId], references: [id], onDelete: Cascade)
+  userId     String                @map("user_id")
+  user       User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  parentId   String?               @map("parent_id")
+  parent     TierListComment?      @relation("TierListCommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies    TierListComment[]     @relation("TierListCommentReplies")
+  likes      TierListCommentLike[]
+  content    String
+  createdAt  DateTime              @default(now()) @map("created_at")
+  updatedAt  DateTime              @updatedAt @map("updated_at")
 
   @@index([tierListId, createdAt])
+  @@index([parentId, createdAt])
   @@map("tier_list_comments")
+}
+
+model TierListCommentLike {
+  id        String          @id @default(uuid())
+  commentId String          @map("comment_id")
+  comment   TierListComment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  userId    String          @map("user_id")
+  user      User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime        @default(now()) @map("created_at")
+
+  @@unique([commentId, userId])
+  @@index([commentId])
+  @@map("tier_list_comment_likes")
 }
 
 model Build {

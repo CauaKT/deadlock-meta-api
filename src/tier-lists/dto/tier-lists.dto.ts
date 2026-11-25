@@ -10,6 +10,7 @@ import {
   IsObject,
   IsOptional,
   IsString,
+  IsUUID,
   Length,
   Matches,
   Max,
@@ -152,4 +153,8 @@ export class CreateTierListCommentDto {
   @IsString({ message: 'O comentário é obrigatório.' })
   @Length(1, 300, { message: 'O comentário deve ter entre 1 e 300 caracteres.' })
   content!: string;
+
+  @IsOptional()
+  @IsUUID(undefined, { message: 'Comentário pai inválido.' })
+  parentId?: string;
 }

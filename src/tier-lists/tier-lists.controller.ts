@@ -36,6 +36,7 @@ export class TierListsController {
     @Query('search') search?: string,
     @Query('heroId') heroId?: string,
     @Query('likedByMe') likedByMe?: string,
+    @Query('savedByMe') savedByMe?: string,
   ) {
     const parsedHeroId = heroId ? Number(heroId) : undefined;
     return this.tierListsService.findAll(user, {
@@ -46,6 +47,7 @@ export class TierListsController {
       search,
       heroId: parsedHeroId && Number.isInteger(parsedHeroId) ? parsedHeroId : undefined,
       likedByMe: likedByMe === '1' || likedByMe === 'true',
+      savedByMe: savedByMe === '1' || savedByMe === 'true',
     });
   }
 
@@ -79,12 +81,32 @@ export class TierListsController {
 
   @UseGuards(JwtAuthGuard)
   @Throttle({ default: { limit: 30, ttl: 60000 } })
+  @Post('comments/:commentId/like')
+  async toggleCommentLike(
+    @Param('commentId', ParseUUIDPipe) commentId: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.tierListsService.toggleCommentLike(commentId, user);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Throttle({ default: { limit: 30, ttl: 60000 } })
   @Post(':id/like')
   async toggleLike(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: AuthenticatedUser,
   ) {
     return this.tierListsService.toggleLike(id, user);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Throttle({ default: { limit: 30, ttl: 60000 } })
+  @Post(':id/save')
+  async toggleSave(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.tierListsService.toggleSave(id, user);
   }
 
   @Throttle({ default: { limit: 30, ttl: 60000 } })
