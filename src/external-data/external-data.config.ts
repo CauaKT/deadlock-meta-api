@@ -24,6 +24,23 @@ export const LEADERBOARD_LIMIT_CONFIG = {
 export const RANK_POINTS_PER_TIER = 6500;
 export const MAX_RANK_TIER = 11;
 
+export const STEAM_NEWS_URL =
+  'https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=1422450&count=100&feeds=steam_community_announcements';
+
+export const OPENAI_TRANSLATION_CONFIG = {
+  url: 'https://api.openai.com/v1/chat/completions',
+  model: 'gpt-4o-mini',
+  batchSize: 45,
+  maxConcurrency: 2,
+} as const;
+
+export const GEMINI_TRANSLATION_CONFIG = {
+  baseUrl: 'https://generativelanguage.googleapis.com/v1beta/models',
+  models: ['gemini-3.5-flash-lite', 'gemini-flash-lite-latest'] as const,
+  batchSize: 60,
+  maxConcurrency: 2,
+} as const;
+
 export const EXTERNAL_CACHE_TTL_SECONDS = {
   activeMatches: 60,
   playerSummary: 900,
@@ -32,4 +49,6 @@ export const EXTERNAL_CACHE_TTL_SECONDS = {
   playerbaseDaily: 3600,
   rankDistribution: 3600,
   matchDetail: 86400,
+  steamNews: 3600,
+  patchNoteTranslation: 15_552_000,
 } as const;

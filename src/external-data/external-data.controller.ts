@@ -1,4 +1,5 @@
 import { Controller, Get, Param, Query } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import { ExternalDataService } from './external-data.service';
 
 @Controller('external-data')
@@ -55,5 +56,11 @@ export class ExternalDataController {
   @Get('matches/:matchId')
   getMatchDetail(@Param('matchId') matchId: string) {
     return this.externalDataService.getMatchDetail(matchId);
+  }
+
+  @Throttle({ default: { limit: 20, ttl: 60000 } })
+  @Get('patch-notes/:gid/pt-br')
+  getPatchNoteTranslation(@Param('gid') gid: string) {
+    return this.externalDataService.getPatchNoteTranslation(gid);
   }
 }

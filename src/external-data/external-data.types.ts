@@ -137,3 +137,14 @@ export interface PlayerbaseOverviewResponse {
   regions: Array<{ region: string; players: number }>;
   fetchedAt: string;
 }
+
+export type PatchLineImpact = 'buff' | 'nerf' | 'adj' | 'fix';
+
+export interface PatchNoteTranslationResponse {
+  gid: string;
+  available: boolean;
+  titlePt: string;
+  translations: Record<string, string>;
+  impacts?: Record<string, PatchLineImpact>;
+  fetchedAt: string;
+}

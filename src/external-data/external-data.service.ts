@@ -2,8 +2,10 @@ import {
   BadRequestException,
   Injectable,
   Logger,
+  NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import type {
@@ -15,6 +17,7 @@ import type {
   NormalizedPlayerHeroStat,
   NormalizedPlayerMatch,
   NormalizedPlayerSummary,
+  PatchNoteTranslationResponse,
   PlayerbaseOverviewResponse,
   RankDistributionResponse,
   RankDistributionTier,
@@ -25,19 +28,73 @@ import {
   DEADLOCK_API_BASE,
   DEFAULT_LEADERBOARD_REGION,
   EXTERNAL_CACHE_TTL_SECONDS,
+  GEMINI_TRANSLATION_CONFIG,
   LEADERBOARD_LIMIT_CONFIG,
   MAX_RANK_TIER,
+  OPENAI_TRANSLATION_CONFIG,
   RANK_POINTS_PER_TIER,
   REGIONAL_LIST,
   STEAM64_BASE,
+  STEAM_NEWS_URL,
 } from './external-data.config';
+
+interface SteamNewsItemRaw {
+  gid?: string;
+  title?: string;
+  contents?: string;
+}
+
+interface SteamNewsApiResponse {
+  appnews?: {
+    newsitems?: SteamNewsItemRaw[];
+  };
+}
+
+interface OpenAiChatResponse {
+  choices?: Array<{
+    message?: {
+      content?: string | null;
+    };
+  }>;
+}
+
+interface GeminiGenerateResponse {
+  candidates?: Array<{
+    content?: {
+      parts?: Array<{
+        text?: string;
+      }>;
+    };
+  }>;
+}
+
+type PatchLineImpact = 'buff' | 'nerf' | 'adj' | 'fix';
+
+interface PatchBatchTranslationResult {
+  translations: Record<string, string>;
+  impacts: Record<string, PatchLineImpact>;
+}
+
+const PATCH_TRANSLATION_SYSTEM_PROMPT =
+  'Você é um tradutor e analista especializado em notas de atualização (patch notes) do jogo Deadlock (Valve) para português brasileiro (PT-BR) natural, claro e sem erros gramaticais.\n' +
+  'Regras obrigatórias:\n' +
+  '1. Preserve TODOS os números, porcentagens, durações, unidades (m, s, %), sinais (+/-) e setas (->) com exatidão.\n' +
+  '2. Mantenha sem traduzir os nomes próprios dos heróis (ex.: Abrams, Apollo, Baba, Bebop, Calico, Celeste, Dynamo, Grey Talon, Haze, Holliday, Infernus, Ivy, Kelvin, Lady Geist, Lash, McGinnis, Mirage, Mo & Krill, Nurse Harrow, Paradox, Pocket, Rem, Seven, Shiv, Sinclair, Venator, Vindicta, Viscous, Vyper, Warden, Wraith, Yamato) e siglas como T1, T2, T3.\n' +
+  '3. Se uma linha começar com "Nome: ...", preserve a estrutura "Nome: ..." no início da frase.\n' +
+  '4. Use terminologia consistente do Deadlock em PT-BR: Souls -> Almas; Boons -> Bênçãos; Net Worth -> Patrimônio; Soul Orb -> Orbe de Alma; Bullet Damage -> Dano de Arma; Spirit Damage/Power -> Dano Espiritual/Poder Espiritual; Bullet Resist -> Resistência a Balas; Spirit Resist -> Resistência Espiritual; Cooldown -> Tempo de Recarga; Parry -> Aparar; Heavy/Light Melee -> Corpo a Corpo Pesado/Leve; Unstable Rift -> Fenda Instável; Sinner\'s Sacrifice -> Sacrifício do Pecador; Trooper(s) -> Troopers.\n' +
+  '5. Classifique cada linha de mudança de herói, habilidade ou item em "impacts" com exatamente um valor: "buff" (melhoria de poder, maior dano/vida/alcance/escala/duração benéfica, menor cooldown/custo), "nerf" (redução de poder, menor dano/vida/alcance/duração, maior cooldown/custo/dano próprio), "fix" (correção de bug, ex.: "Fixed...") ou "adj" (ajuste neutro/misto, rework de mecânica, melhoria apenas de tooltip/UI, troca entre tiers). Omita de "impacts" títulos, cabeçalhos de seção e textos narrativos.\n' +
+  '6. Responda APENAS com um objeto JSON no formato {"items": {"0": "...", ...}, "impacts": {"0": "buff|nerf|adj|fix", ...}} mantendo exatamente as mesmas chaves numéricas enviadas em "items".';
 
 @Injectable()
 export class ExternalDataService {
   private readonly logger = new Logger(ExternalDataService.name);
   private readonly refreshingKeys = new Set<string>();
+  private readonly inflightTranslations = new Map<string, Promise<PatchNoteTranslationResponse>>();
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly config: ConfigService,
+  ) {}
 
   private normalizeAccountId(raw: string): string {
     const clean = raw.trim();
@@ -1437,6 +1494,408 @@ export class ExternalDataService {
     );
 
     return { ...data, fetchedAt };
+  }
+
+  private decodePatchEntities(text: string): string {
+    return text
+      .replace(/\u00a0/g, ' ')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&amp;/gi, '&')
+      .replace(/&lt;/gi, '<')
+      .replace(/&gt;/gi, '>')
+      .replace(/&quot;/gi, '"')
+      .replace(/&#39;|&#x27;/gi, "'")
+      .replace(/\\\[/g, '[')
+      .replace(/\\\]/g, ']');
+  }
+
+  private stripPatchInlineTags(raw: string): string {
+    return this.decodePatchEntities(
+      raw.replace(/\[\/?[a-z0-9*]+(?:=[^\]]*|\s+[^\]]*)?\]/gi, ''),
+    ).trim();
+  }
+
+  private extractPatchTranslatableLines(title: string, rawContent: string): string[] {
+    let normalized = rawContent
+      .replace(/\r\n/g, '\n')
+      .replace(/\\\[/g, '[')
+      .replace(/\\\]/g, ']');
+
+    normalized = normalized
+      .replace(/\[url=[^\]]+\]\s*\[img(?:\s+src="[^"]*")?\][\s\S]*?\[\/img\]\s*\[\/url\]/gi, '\n')
+      .replace(/\[img(?:\s+src="[^"]*")?\][\s\S]*?\[\/img\]/gi, '\n')
+      .replace(/\[h3\]([\s\S]*?)\[\/h3\]/gi, (_m, inner: string) => `\n@@H3@@${this.stripPatchInlineTags(inner)}\n`)
+      .replace(/\[list\]/gi, '\n')
+      .replace(/\[\/list\]/gi, '\n')
+      .replace(/\[\*\]/gi, '\n@@LI@@')
+      .replace(/\[\/?p\]/gi, '\n')
+      .replace(/<br\s*\/?>/gi, '\n');
+
+    const unique = new Set<string>();
+    const add = (value: string) => {
+      const clean = value.trim();
+      if (clean) unique.add(clean);
+    };
+
+    add(title);
+
+    for (const rawLine of normalized.split('\n')) {
+      const trimmed = rawLine.trim();
+      if (!trimmed) continue;
+
+      if (trimmed.startsWith('@@H3@@')) {
+        add(trimmed.slice(6));
+        continue;
+      }
+
+      if (trimmed.startsWith('@@LI@@')) {
+        add(this.stripPatchInlineTags(trimmed.slice(6)));
+        continue;
+      }
+
+      const plainLine = this.stripPatchInlineTags(trimmed);
+      if (!plainLine || /^-{5,}$/.test(plainLine)) continue;
+
+      const secMatch = plainLine.match(/^\[([^\]]{2,60})\]$/);
+      const boldSecMatch = !secMatch
+        ? trimmed.match(
+            /^\[b\]\s*(General|Items|Heroes|Bug\s*Fixes|Gameplay|Map|Misc|Miscellaneous|UI|Audio|Visuals)\s*:?\s*\[\/b\]$/i,
+          )
+        : null;
+      if (secMatch || boldSecMatch) {
+        add((secMatch?.[1] ?? boldSecMatch?.[1] ?? '').trim());
+        continue;
+      }
+
+      if (/^-{1,2}\s+/.test(trimmed) || /^•\s+/.test(trimmed) || /^-{1,2}\s+/.test(plainLine) || /^•\s+/.test(plainLine)) {
+        const withoutDash = trimmed.replace(/^(\[(?:b|i|u)\])*\s*(?:--|[-•])\s+/i, '$1');
+        add(this.stripPatchInlineTags(withoutDash));
+        continue;
+      }
+
+      add(plainLine);
+    }
+
+    return Array.from(unique);
+  }
+
+  private parseJsonTranslationItems(
+    rawContent: string,
+    batch: string[],
+    providerName: string,
+  ): PatchBatchTranslationResult {
+    const cleaned = rawContent
+      .trim()
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/\s*```$/i, '');
+
+    const parsed = JSON.parse(cleaned) as {
+      items?: Record<string, unknown>;
+      impacts?: Record<string, unknown>;
+    };
+    const outItems = parsed?.items;
+    if (!outItems || typeof outItems !== 'object') {
+      throw new Error(`Formato JSON inválido retornado por ${providerName}.`);
+    }
+
+    const rawImpacts =
+      parsed?.impacts && typeof parsed.impacts === 'object' ? parsed.impacts : {};
+    const validImpacts = new Set<PatchLineImpact>(['buff', 'nerf', 'adj', 'fix']);
+    const translations: Record<string, string> = {};
+    const impacts: Record<string, PatchLineImpact> = {};
+
+    for (let idx = 0; idx < batch.length; idx += 1) {
+      const original = batch[idx];
+      const val = outItems[String(idx)];
+      translations[original] =
+        typeof val === 'string' && val.trim().length > 0 ? val.trim() : original;
+
+      const impVal = rawImpacts[String(idx)];
+      if (typeof impVal === 'string') {
+        const normalizedImp = impVal.trim().toLowerCase() as PatchLineImpact;
+        if (validImpacts.has(normalizedImp)) {
+          impacts[original] = normalizedImp;
+        }
+      }
+    }
+
+    return { translations, impacts };
+  }
+
+  private async translateBatchWithOpenAi(
+    apiKey: string,
+    batch: string[],
+  ): Promise<PatchBatchTranslationResult> {
+    const inputMap = Object.fromEntries(batch.map((text, idx) => [String(idx), text]));
+
+    const res = await fetch(OPENAI_TRANSLATION_CONFIG.url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: OPENAI_TRANSLATION_CONFIG.model,
+        temperature: 0.1,
+        response_format: { type: 'json_object' },
+        messages: [
+          {
+            role: 'system',
+            content: PATCH_TRANSLATION_SYSTEM_PROMPT,
+          },
+          {
+            role: 'user',
+            content: JSON.stringify({ items: inputMap }),
+          },
+        ],
+      }),
+      signal: AbortSignal.timeout(45_000),
+    });
+
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '');
+      throw new Error(`OpenAI HTTP ${res.status}: ${detail.slice(0, 200)}`);
+    }
+
+    const data = (await res.json()) as OpenAiChatResponse;
+    const rawContent = data.choices?.[0]?.message?.content;
+    if (!rawContent) {
+      throw new Error('OpenAI retornou resposta vazia.');
+    }
+
+    return this.parseJsonTranslationItems(rawContent, batch, 'OpenAI');
+  }
+
+  private async translateBatchWithGemini(
+    apiKey: string,
+    model: string,
+    batch: string[],
+  ): Promise<PatchBatchTranslationResult> {
+    const inputMap = Object.fromEntries(batch.map((text, idx) => [String(idx), text]));
+
+    const res = await fetch(
+      `${GEMINI_TRANSLATION_CONFIG.baseUrl}/${model}:generateContent`,
+      {
+        method: 'POST',
+      headers: {
+        'x-goog-api-key': apiKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        systemInstruction: {
+          parts: [{ text: PATCH_TRANSLATION_SYSTEM_PROMPT }],
+        },
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: JSON.stringify({ items: inputMap }) }],
+          },
+        ],
+        generationConfig: {
+          temperature: 0.1,
+          responseMimeType: 'application/json',
+        },
+      }),
+        signal: AbortSignal.timeout(45_000),
+      },
+    );
+
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '');
+      throw new Error(`Gemini HTTP ${res.status}: ${detail.slice(0, 200)}`);
+    }
+
+    const data = (await res.json()) as GeminiGenerateResponse;
+    const rawContent = data.candidates?.[0]?.content?.parts
+      ?.filter((part) => !(part as { thought?: boolean }).thought)
+      .map((part) => part.text ?? '')
+      .join('');
+    if (!rawContent) {
+      throw new Error('Gemini retornou resposta vazia.');
+    }
+
+    return this.parseJsonTranslationItems(rawContent, batch, 'Gemini');
+  }
+
+  private async runTranslationBatches(
+    lines: string[],
+    batchSize: number,
+    maxConcurrency: number,
+    translateBatch: (batch: string[]) => Promise<PatchBatchTranslationResult>,
+  ): Promise<PatchBatchTranslationResult> {
+    const chunks: string[][] = [];
+    for (let i = 0; i < lines.length; i += batchSize) {
+      chunks.push(lines.slice(i, i + batchSize));
+    }
+
+    const translations: Record<string, string> = {};
+    const impacts: Record<string, PatchLineImpact> = {};
+    for (let i = 0; i < chunks.length; i += maxConcurrency) {
+      const group = chunks.slice(i, i + maxConcurrency);
+      const results = await Promise.all(group.map((batch) => translateBatch(batch)));
+      for (const partial of results) {
+        Object.assign(translations, partial.translations);
+        Object.assign(impacts, partial.impacts);
+      }
+    }
+    return { translations, impacts };
+  }
+
+  async getPatchNoteTranslation(rawGid: string): Promise<PatchNoteTranslationResponse> {
+    const gid = rawGid.trim();
+    if (!/^\d{6,30}$/.test(gid)) {
+      throw new BadRequestException('ID de patch inválido.');
+    }
+
+    const cacheKey = `patch_note_ptbr:${gid}:v2`;
+    const now = new Date();
+    const cached = await this.prisma.externalCache.findUnique({
+      where: { key: cacheKey },
+    });
+
+    if (cached && cached.expiresAt > now) {
+      return cached.payload as unknown as PatchNoteTranslationResponse;
+    }
+
+    let job = this.inflightTranslations.get(gid);
+    if (!job) {
+      job = (async (): Promise<PatchNoteTranslationResponse> => {
+        try {
+          const { data: steamItems } = await this.withDbCache<SteamNewsItemRaw[]>(
+        'steam_news_announcements',
+        'steam-news',
+        EXTERNAL_CACHE_TTL_SECONDS.steamNews,
+        async () => {
+          const json = await this.fetchJson<SteamNewsApiResponse>(STEAM_NEWS_URL, 15_000);
+          return json.appnews?.newsitems ?? [];
+        },
+        true,
+      );
+
+      const target = steamItems.find((item) => String(item.gid ?? '') === gid);
+      if (!target || !target.title || !target.contents) {
+        throw new NotFoundException('Nota de patch oficial não encontrada.');
+      }
+
+      const title = target.title.trim();
+      const geminiKey = this.config.get<string>('GEMINI_API_KEY')?.trim();
+      const openAiKey = this.config.get<string>('OPENAI_API_KEY')?.trim();
+
+      const providers: Array<{
+        source: string;
+        batchSize: number;
+        maxConcurrency: number;
+        translate: (batch: string[]) => Promise<PatchBatchTranslationResult>;
+      }> = [];
+
+      if (geminiKey) {
+        for (const model of GEMINI_TRANSLATION_CONFIG.models) {
+          providers.push({
+            source: model,
+            batchSize: GEMINI_TRANSLATION_CONFIG.batchSize,
+            maxConcurrency: GEMINI_TRANSLATION_CONFIG.maxConcurrency,
+            translate: (batch) => this.translateBatchWithGemini(geminiKey, model, batch),
+          });
+        }
+      }
+      if (openAiKey) {
+        providers.push({
+          source: 'openai-gpt-4o-mini',
+          batchSize: OPENAI_TRANSLATION_CONFIG.batchSize,
+          maxConcurrency: OPENAI_TRANSLATION_CONFIG.maxConcurrency,
+          translate: (batch) => this.translateBatchWithOpenAi(openAiKey, batch),
+        });
+      }
+
+      if (providers.length === 0) {
+        return {
+          gid,
+          available: false,
+          titlePt: title,
+          translations: {},
+          impacts: {},
+          fetchedAt: new Date().toISOString(),
+        };
+      }
+
+      const lines = this.extractPatchTranslatableLines(title, target.contents);
+      let batchResult: PatchBatchTranslationResult | null = null;
+      let usedSource = providers[0].source;
+      let lastError: unknown = null;
+
+      for (const provider of providers) {
+        try {
+          batchResult = await this.runTranslationBatches(
+            lines,
+            provider.batchSize,
+            provider.maxConcurrency,
+            provider.translate,
+          );
+          usedSource = provider.source;
+          break;
+        } catch (err) {
+          lastError = err;
+          this.logger.warn(
+            `Provedor ${provider.source} falhou ao traduzir patch ${gid}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+
+      if (!batchResult) {
+        throw lastError instanceof Error ? lastError : new Error('Falha ao traduzir patch.');
+      }
+
+      const fetchedAt = new Date();
+      const payload: PatchNoteTranslationResponse = {
+        gid,
+        available: true,
+        titlePt: batchResult.translations[title] ?? title,
+        translations: batchResult.translations,
+        impacts: batchResult.impacts,
+        fetchedAt: fetchedAt.toISOString(),
+      };
+
+      const expiresAt = new Date(
+        fetchedAt.getTime() + EXTERNAL_CACHE_TTL_SECONDS.patchNoteTranslation * 1000,
+      );
+
+      await this.prisma.externalCache.upsert({
+        where: { key: cacheKey },
+        create: {
+          key: cacheKey,
+          source: usedSource,
+          payload: payload as unknown as Prisma.InputJsonValue,
+          fetchedAt,
+          expiresAt,
+        },
+        update: {
+          source: usedSource,
+          payload: payload as unknown as Prisma.InputJsonValue,
+          fetchedAt,
+          expiresAt,
+        },
+      });
+
+      return payload;
+        } catch (err) {
+          if (err instanceof BadRequestException || err instanceof NotFoundException) {
+            throw err;
+          }
+          this.logger.warn(
+            `Falha ao traduzir patch ${gid}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          if (cached) {
+            return cached.payload as unknown as PatchNoteTranslationResponse;
+          }
+          throw new ServiceUnavailableException('Não foi possível traduzir o patch agora.');
+        } finally {
+          this.inflightTranslations.delete(gid);
+        }
+      })();
+      this.inflightTranslations.set(gid, job);
+    }
+
+    return job;
   }
 
   async getStatus(): Promise<ExternalDataStatus> {
