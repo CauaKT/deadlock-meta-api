@@ -78,12 +78,13 @@ interface PatchBatchTranslationResult {
 const PATCH_TRANSLATION_SYSTEM_PROMPT =
   'Você é um tradutor e analista especializado em notas de atualização (patch notes) do jogo Deadlock (Valve) para português brasileiro (PT-BR) natural, claro e sem erros gramaticais.\n' +
   'Regras obrigatórias:\n' +
-  '1. Preserve TODOS os números, porcentagens, durações, unidades (m, s, %), sinais (+/-) e setas (->) com exatidão.\n' +
-  '2. Mantenha sem traduzir os nomes próprios dos heróis (ex.: Abrams, Apollo, Baba, Bebop, Calico, Celeste, Dynamo, Grey Talon, Haze, Holliday, Infernus, Ivy, Kelvin, Lady Geist, Lash, McGinnis, Mirage, Mo & Krill, Nurse Harrow, Paradox, Pocket, Rem, Seven, Shiv, Sinclair, Venator, Vindicta, Viscous, Vyper, Warden, Wraith, Yamato) e siglas como T1, T2, T3.\n' +
-  '3. Se uma linha começar com "Nome: ...", preserve a estrutura "Nome: ..." no início da frase.\n' +
-  '4. Use terminologia consistente do Deadlock em PT-BR: Souls -> Almas; Boons -> Bênçãos; Net Worth -> Patrimônio; Soul Orb -> Orbe de Alma; Bullet Damage -> Dano de Arma; Spirit Damage/Power -> Dano Espiritual/Poder Espiritual; Bullet Resist -> Resistência a Balas; Spirit Resist -> Resistência Espiritual; Cooldown -> Tempo de Recarga; Parry -> Aparar; Heavy/Light Melee -> Corpo a Corpo Pesado/Leve; Unstable Rift -> Fenda Instável; Sinner\'s Sacrifice -> Sacrifício do Pecador; Trooper(s) -> Troopers.\n' +
-  '5. Classifique cada linha de mudança de herói, habilidade ou item em "impacts" com exatamente um valor: "buff" (melhoria de poder, maior dano/vida/alcance/escala/duração benéfica, menor cooldown/custo), "nerf" (redução de poder, menor dano/vida/alcance/duração, maior cooldown/custo/dano próprio), "fix" (correção de bug, ex.: "Fixed...") ou "adj" (ajuste neutro/misto, rework de mecânica, melhoria apenas de tooltip/UI, troca entre tiers). Omita de "impacts" títulos, cabeçalhos de seção e textos narrativos.\n' +
-  '6. Responda APENAS com um objeto JSON no formato {"items": {"0": "...", ...}, "impacts": {"0": "buff|nerf|adj|fix", ...}} mantendo exatamente as mesmas chaves numéricas enviadas em "items".';
+  '1. Em "items", traduza TODAS as entradas recebidas do inglês para português brasileiro (PT-BR), incluindo títulos de atualização (ex.: "Minor Update - 11-26-2026" -> "Atualização Menor - 26/11/2026"), cabeçalhos de seção (ex.: "General" -> "Geral", "Items" -> "Itens", "Heroes" -> "Heróis", "Bug Fixes" -> "Correções de Bugs"), frases introdutórias/narrativas e todas as notas. NUNCA copie a frase em inglês sem traduzir em "items".\n' +
+  '2. Preserve TODOS os números, porcentagens, durações, unidades (m, s, %), sinais (+/-) e setas (->) com exatidão.\n' +
+  '3. Mantenha sem traduzir os nomes próprios dos heróis (ex.: Abrams, Apollo, Baba, Bebop, Calico, Celeste, Doorman, Dynamo, Grey Talon, Haze, Holliday, Infernus, Ivy, Kelvin, Lady Geist, Lash, McGinnis, Mirage, Mo & Krill, Nurse Harrow, Paradox, Pocket, Rem, Seven, Shiv, Sinclair, Venator, Vindicta, Viscous, Vyper, Warden, Wraith, Yamato) e siglas como T1, T2, T3.\n' +
+  '4. Se uma linha começar com "Nome: ...", preserve a estrutura "Nome: ..." no início da frase.\n' +
+  '5. Use terminologia consistente do Deadlock em PT-BR: Souls -> Almas; Boons -> Bênçãos; Net Worth -> Patrimônio; Soul Orb -> Orbe de Alma; Bullet Damage -> Dano de Arma; Spirit Damage/Power -> Dano Espiritual/Poder Espiritual; Bullet Resist -> Resistência a Balas; Spirit Resist -> Resistência Espiritual; Cooldown -> Tempo de Recarga; Parry -> Aparar; Heavy/Light Melee -> Corpo a Corpo Pesado/Leve; Unstable Rift -> Fenda Instável; Sinner\'s Sacrifice -> Sacrifício do Pecador; Trooper(s) -> Troopers.\n' +
+  '6. Classifique cada linha de mudança de herói, habilidade ou item em "impacts" com exatamente um valor: "buff" (melhoria de poder, maior dano/vida/alcance/escala/duração benéfica, menor cooldown/custo), "nerf" (redução de poder, menor dano/vida/alcance/duração, maior cooldown/custo/dano próprio), "fix" (correção de bug, ex.: "Fixed...") ou "adj" (ajuste neutro/misto, rework de mecânica, melhoria apenas de tooltip/UI, troca entre tiers). Omita de "impacts" títulos, cabeçalhos de seção e textos narrativos.\n' +
+  '7. Responda APENAS com um objeto JSON no formato {"items": {"0": "...", ...}, "impacts": {"0": "buff|nerf|adj|fix", ...}} mantendo exatamente as mesmas chaves numéricas enviadas em "items".';
 
 @Injectable()
 export class ExternalDataService {
@@ -1619,6 +1620,24 @@ export class ExternalDataService {
       }
     }
 
+    const translatableEntries = batch.filter((s) =>
+      /[a-zA-Z]{3,}\s+[a-zA-Z]{2,}/.test(s),
+    );
+    let unchangedCount = 0;
+    for (const orig of translatableEntries) {
+      if (translations[orig].toLowerCase() === orig.trim().toLowerCase()) {
+        unchangedCount += 1;
+      }
+    }
+    if (
+      translatableEntries.length >= 3 &&
+      unchangedCount / translatableEntries.length > 0.65
+    ) {
+      throw new Error(
+        `${providerName} retornou lote sem tradução em PT-BR (${unchangedCount}/${translatableEntries.length} inalteradas).`,
+      );
+    }
+
     return { translations, impacts };
   }
 
@@ -1673,48 +1692,60 @@ export class ExternalDataService {
   ): Promise<PatchBatchTranslationResult> {
     const inputMap = Object.fromEntries(batch.map((text, idx) => [String(idx), text]));
 
-    const res = await fetch(
-      `${GEMINI_TRANSLATION_CONFIG.baseUrl}/${model}:generateContent`,
-      {
-        method: 'POST',
-      headers: {
-        'x-goog-api-key': apiKey,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        systemInstruction: {
-          parts: [{ text: PATCH_TRANSLATION_SYSTEM_PROMPT }],
-        },
-        contents: [
-          {
-            role: 'user',
-            parts: [{ text: JSON.stringify({ items: inputMap }) }],
+    let lastContentError: unknown = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const res = await fetch(
+        `${GEMINI_TRANSLATION_CONFIG.baseUrl}/${model}:generateContent`,
+        {
+          method: 'POST',
+          headers: {
+            'x-goog-api-key': apiKey,
+            'Content-Type': 'application/json',
           },
-        ],
-        generationConfig: {
-          temperature: 0.1,
-          responseMimeType: 'application/json',
+          body: JSON.stringify({
+            systemInstruction: {
+              parts: [{ text: PATCH_TRANSLATION_SYSTEM_PROMPT }],
+            },
+            contents: [
+              {
+                role: 'user',
+                parts: [{ text: JSON.stringify({ items: inputMap }) }],
+              },
+            ],
+            generationConfig: {
+              temperature: attempt === 0 ? 0.1 : 0.2,
+              responseMimeType: 'application/json',
+            },
+          }),
+          signal: AbortSignal.timeout(45_000),
         },
-      }),
-        signal: AbortSignal.timeout(45_000),
-      },
-    );
+      );
 
-    if (!res.ok) {
-      const detail = await res.text().catch(() => '');
-      throw new Error(`Gemini HTTP ${res.status}: ${detail.slice(0, 200)}`);
+      if (!res.ok) {
+        const detail = await res.text().catch(() => '');
+        throw new Error(`Gemini HTTP ${res.status}: ${detail.slice(0, 200)}`);
+      }
+
+      const data = (await res.json()) as GeminiGenerateResponse;
+      const rawContent = data.candidates?.[0]?.content?.parts
+        ?.filter((part) => !(part as { thought?: boolean }).thought)
+        .map((part) => part.text ?? '')
+        .join('');
+      if (!rawContent) {
+        lastContentError = new Error('Gemini retornou resposta vazia.');
+        continue;
+      }
+
+      try {
+        return this.parseJsonTranslationItems(rawContent, batch, 'Gemini');
+      } catch (err) {
+        lastContentError = err;
+      }
     }
 
-    const data = (await res.json()) as GeminiGenerateResponse;
-    const rawContent = data.candidates?.[0]?.content?.parts
-      ?.filter((part) => !(part as { thought?: boolean }).thought)
-      .map((part) => part.text ?? '')
-      .join('');
-    if (!rawContent) {
-      throw new Error('Gemini retornou resposta vazia.');
-    }
-
-    return this.parseJsonTranslationItems(rawContent, batch, 'Gemini');
+    throw lastContentError instanceof Error
+      ? lastContentError
+      : new Error('Gemini falhou ao traduzir lote.');
   }
 
   private async runTranslationBatches(
@@ -1747,7 +1778,7 @@ export class ExternalDataService {
       throw new BadRequestException('ID de patch inválido.');
     }
 
-    const cacheKey = `patch_note_ptbr:${gid}:v2`;
+    const cacheKey = `patch_note_ptbr:${gid}:v3`;
     const now = new Date();
     const cached = await this.prisma.externalCache.findUnique({
       where: { key: cacheKey },

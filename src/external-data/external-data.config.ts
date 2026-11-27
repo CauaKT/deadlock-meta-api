@@ -37,7 +37,7 @@ export const OPENAI_TRANSLATION_CONFIG = {
 export const GEMINI_TRANSLATION_CONFIG = {
   baseUrl: 'https://generativelanguage.googleapis.com/v1beta/models',
   models: ['gemini-3.5-flash-lite', 'gemini-flash-lite-latest'] as const,
-  batchSize: 60,
+  batchSize: 45,
   maxConcurrency: 2,
 } as const;
 
